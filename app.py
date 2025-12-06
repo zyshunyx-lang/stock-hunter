@@ -9,16 +9,15 @@ import pytz
 import io
 
 # -----------------------------------------------------------------------------
-# 0. 全局配置
+# 0. Global Config
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="猎人指挥中心 V8.4",
+    page_title="Hunter V8.5",
     page_icon="🏹",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# 样式
 st.markdown("""
 <style>
     .metric-card {
@@ -32,15 +31,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 1. 辅助函数
+# 1. Helper Functions
 # -----------------------------------------------------------------------------
 def get_beijing_time():
-    """获取北京时间"""
     utc_now = datetime.datetime.now(pytz.utc)
     return utc_now.astimezone(pytz.timezone('Asia/Shanghai'))
 
 def calculate_macd(df, short=12, long=26, mid=9):
-    """计算 MACD"""
     close = df['close']
     ema12 = close.ewm(span=short, adjust=False).mean()
     ema26 = close.ewm(span=long, adjust=False).mean()
@@ -50,12 +47,11 @@ def calculate_macd(df, short=12, long=26, mid=9):
     return dif, dea, macd
 
 # -----------------------------------------------------------------------------
-# 2. 核心算法：筹码分布
+# 2. Chip Distribution Algo
 # -----------------------------------------------------------------------------
 def calc_chip_distribution(df, decimals=2):
     chip_dict = {} 
     
-    # 检查列名，Akshare 可能会返回中文列名，需在外部处理好
     if 'turnover_ratio' not in df.columns:
         df['turnover_ratio'] = 1.0 
     else:
@@ -63,13 +59,11 @@ def calc_chip_distribution(df, decimals=2):
 
     for index, row in df.iterrows():
         price = round(row['close'], decimals)
-        turnover = row['turnover_ratio'] / 100.0  # 确保是浮点除法
+        turnover = row['turnover_ratio'] / 100.0
         
-        # 衰减
         for p in list(chip_dict.keys()):
             chip_dict[p] = chip_dict[p] * (1.0 - turnover)
         
-        # 新增
         if price in chip_dict:
             chip_dict[price] += turnover
         else:
@@ -105,21 +99,19 @@ def get_chip_metrics(chip_df, current_price):
     return profit_ratio, avg_cost, concentration_90, chip_df
 
 # -----------------------------------------------------------------------------
-# 3. 数据获取模块 (Akshare)
+# 3. Data Fetching (Akshare)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=600)
 def get_full_data(code, days):
     data_bundle = {}
     
-    # --- K线 ---
+    # --- K Line ---
     try:
-        # akshare 接口: stock_zh_a_hist (日期, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率)
         df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
         
         if df is None or df.empty:
-            return None, "Akshare 返回空数据，请检查代码。"
+            return None, "Akshare returned empty data."
         
-        # 英文重命名映射
         rename_map = {
             '日期': 'trade_date',
             '开盘': 'open',
@@ -135,29 +127,25 @@ def get_full_data(code, days):
         df['trade_date'] = pd.to_datetime(df['trade_date'])
         df = df.sort_values('trade_date').reset_index(drop=True)
         
-        # 截取
         if len(df) > days:
             df = df.iloc[-days:].reset_index(drop=True)
             
-        # 强转数值
         cols = ['open', 'high', 'low', 'close', 'volume', 'turnover_ratio', 'pct_change']
         for c in cols:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         
-        # 均线
         for ma in [5, 20, 60, 250]:
             df[f'MA{ma}'] = df['close'].rolling(window=ma).mean()
         
-        # MACD
         df['DIF'], df['DEA'], df['MACD'] = calculate_macd(df)
         
         data_bundle['history'] = df
 
     except Exception as e:
-        return None, f"K线获取失败: {str(e)}"
+        return None, f"Error K-Line: {str(e)}"
 
-    # --- 筹码 ---
+    # --- Chips ---
     try:
         chip_raw_df = calc_chip_distribution(df)
         current_price = df.iloc[-1]['close']
@@ -170,9 +158,9 @@ def get_full_data(code, days):
         }
         data_bundle['chip_data'] = chip_final_df
     except Exception as e:
-        return None, f"筹码计算失败: {str(e)}"
+        return None, f"Error Chips: {str(e)}"
 
-    # --- 财务 ---
+    # --- Financial ---
     try:
         info_df = ak.stock_individual_info_em(symbol=code)
         info_dict = dict(zip(info_df['item'], info_df['value']))
@@ -180,7 +168,7 @@ def get_full_data(code, days):
     except Exception as e:
         data_bundle['financial'] = {}
 
-    # --- 实时 (用K线最新数据兜底) ---
+    # --- Realtime ---
     try:
         last_row = df.iloc[-1]
         data_bundle['realtime'] = {
@@ -194,24 +182,24 @@ def get_full_data(code, days):
     return data_bundle, None
 
 # -----------------------------------------------------------------------------
-# 4. 主界面
+# 4. Main UI
 # -----------------------------------------------------------------------------
-st.sidebar.title("🏹 猎人指挥中心 V8.4")
-st.sidebar.caption("全英文标点修正版")
+st.sidebar.title("Hunter V8.5")
+st.sidebar.caption("Cloud Version")
 st.sidebar.markdown("---")
-input_code = st.sidebar.text_input("股票代码 (6位)", value="603909")
-lookback_days = st.sidebar.slider("K线回看天数", 200, 1000, 500)
+input_code = st.sidebar.text_input("Code (6 digits)", value="603909")
+lookback_days = st.sidebar.slider("Days", 200, 1000, 500)
 
-st.sidebar.markdown("### 🛡️ 风控确认")
-risk_check = st.sidebar.radio("未来30天解禁/减持风险", ["✅ 安全", "⚠️ 有风险/不确定"], index=0)
-risk_notes = st.sidebar.text_area("情报备注", placeholder="在此记录股东动态...")
+st.sidebar.markdown("### Risk Check")
+risk_check = st.sidebar.radio("Unlock Risk", ["Safe", "Risk"], index=0)
+risk_notes = st.sidebar.text_area("Notes", placeholder="Notes here...")
 
-if st.sidebar.button("🚀 启动分析引擎", type="primary"):
-    with st.spinner('数据获取中 (Akshare)...'):
+if st.sidebar.button("Launch", type="primary"):
+    with st.spinner('Fetching Data...'):
         data, err = get_full_data(input_code, lookback_days)
 
     if err:
-        st.error(f"❌ 发生错误: {err}")
+        st.error(f"Error: {err}")
     else:
         hist_df = data['history']
         rt_data = data['realtime']
@@ -219,41 +207,41 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
         chip_metrics = data['chip_metrics']
         chip_dist_df = data['chip_data']
 
-        # 头部
+        # Header
         name = rt_data.get('short_name', input_code)
         price = rt_data.get('price', '-')
         pct_change = rt_data.get('change_pct', 0)
         
         color_change = "red" if float(pct_change) > 0 else "green"
         
-        c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+        c1, c2, c3, c4 = st.columns([2， 2， 2, 2])
         with c1:
-            st.metric("股票名称", f"{name} ({input_code})")
+            st.metric("Name"， f"{name} ({input_code})")
         with c2:
-            st.markdown(f"#### 价格: <span style='color:{color_change}'>{price}</span>", unsafe_allow_html=True)
+            st.markdown(f"#### Price: <span style='color:{color_change}'>{price}</span>", unsafe_allow_html=True)
         with c3:
-            st.markdown(f"#### 幅度: <span style='color:{color_change}'>{pct_change}%</span>", unsafe_allow_html=True)
+            st.markdown(f"#### Change: <span style='color:{color_change}'>{pct_change}%</span>", unsafe_allow_html=True)
         with c4:
-            st.metric("行业", fin_data.get('行业', '-'))
+            st.metric("Industry", fin_data.get('行业', '-'))
 
         st.markdown("---")
 
-        # 仪表盘
+        # Dashboard - FIXED COMMA HERE
         m1, m2, m3, m4 = st.columns(4)
         with m1:
-            st.metric("💰 获利盘"， f"{chip_metrics['profit_ratio']:.2f}%")
+            st.metric("Profit Ratio", f"{chip_metrics['profit_ratio']:.2f}%")
         with m2:
-            st.metric("🎯 均价"， f"{chip_metrics['avg_cost']:.2f}")
+            st.metric("Avg Cost", f"{chip_metrics['avg_cost']:.2f}")
         with m3:
             pe = fin_data.get('市盈率(动)', fin_data.get('市盈率(TTM)', '-'))
-            st.metric("市盈率", pe)
+            st.metric("PE Ratio", f"{pe}")
         with m4:
             val = fin_data.get('总市值', '-')
             if isinstance(val, (int, float)):
-                val = f"{val/100000000:.2f} 亿"
-            st.metric("总市值", val)
+                val = f"{val/100000000:.2f}B"
+            st.metric("Market Cap", f"{val}")
 
-        # 下载 (此处之前报错，重点修复)
+        # Download - FIXED COMMA HERE
         export_df = hist_df.copy()
         bj_time = get_beijing_time()
         export_df['export_time'] = bj_time
@@ -263,26 +251,26 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
         csv = export_df.to_csv(index=False).encode('utf-8-sig')
         
         st.download_button(
-            label="📥 下载数据 (.csv)", 
+            label="Download CSV"， 
             data=csv,
-            file_name=f"Stock_{input_code}.csv",
+            file_name=f"Stock_{input_code}.csv"，
             mime="text/csv"
         )
 
-        # 图表
-        tab1, tab2 = st.tabs(["📊 K线"， "🧩 筹码"])
+        # Tabs
+        tab1, tab2 = st.tabs(["K-Line", "Chips"])
 
         with tab1:
-            fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7， 0.3])
+            fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
             
             fig_k.add_trace(go.Candlestick(
-                x=hist_df['trade_date']，
-                open=hist_df['open'], high=hist_df['high']，
-                low=hist_df['low'], close=hist_df['close'],
+                x=hist_df['trade_date'],
+                open=hist_df['open'], high=hist_df['high'],
+                low=hist_df['low'], close=hist_df['close']，
                 name='K'
             ), row=1, col=1)
             
-            for ma, color in zip([5, 20, 60], ['orange', 'purple', 'blue']):
+            for ma, color 在 zip([5， 20， 60]， ['orange', 'purple', 'blue']):
                 if f'MA{ma}' in hist_df.columns:
                     fig_k.add_trace(go.Scatter(
                         x=hist_df['trade_date'], y=hist_df[f'MA{ma}'],
@@ -291,7 +279,7 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             
             vol_colors = ['red' if r['close'] >= r['open'] else 'green' for i, r in hist_df.iterrows()]
             fig_k.add_trace(go.Bar(
-                x=hist_df['trade_date'], y=hist_df['volume']，
+                x=hist_df['trade_date'], y=hist_df['volume'],
                 name='Vol', marker_color=vol_colors
             ), row=2, col=1)
 
@@ -301,15 +289,4 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
         with tab2:
             cur_p = float(price) if price != '-' else 0
             chip_prof = chip_dist_df[chip_dist_df['price'] <= cur_p]
-            chip_loss = chip_dist_df[chip_dist_df['price'] > cur_p]
-            
-            fig_c = go.Figure()
-            fig_c.add_trace(go.Bar(y=chip_prof['price'], x=chip_prof['volume'], orientation='h', marker_color='red', name='获利'))
-            fig_c.add_trace(go.Bar(y=chip_loss['price'], x=chip_loss['volume'], orientation='h', marker_color='green', name='套牢'))
-            fig_c.add_hline(y=cur_p, line_dash="dash", line_color="black")
-            
-            fig_c.update_layout(height=600, margin=dict(l=0,r=0,t=30,b=0), title="筹码分布")
-            st.plotly_chart(fig_c, use_container_width=True)
-
-else:
-    st.info("👈 请在左侧点击启动")
+            chip_loss = ch
