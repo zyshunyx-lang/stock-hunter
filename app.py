@@ -244,7 +244,7 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
         for k, v in fin_data.items():
             export_df.loc[0, f"fin_{k}"] = v
 
-        csv = export_df.to_csv(index=False)。encode('utf-8-sig')
+        csv = export_df.to_csv(index=False).encode('utf-8-sig')
         
         # 修复点：这里确保使用了英文逗号
         st.download_button(
@@ -322,3 +322,4 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
 
 else:
     st.info("👈 请在左侧输入股票代码并点击【启动分析引擎】")
+
