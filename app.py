@@ -12,7 +12,7 @@ import time
 # 0. Global Config
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Hunter V8.6",
+    page_title="Hunter V8.7",
     page_icon="🏹",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -51,6 +51,7 @@ def calculate_macd(df, short=12, long=26, mid=9):
 # -----------------------------------------------------------------------------
 def calc_chip_distribution(df, decimals=2):
     chip_dict = {} 
+    # 兼容处理：如果没有换手率数据，默认设为1.0
     if 'turnover_ratio' not in df.columns:
         df['turnover_ratio'] = 1.0 
     else:
@@ -60,11 +61,11 @@ def calc_chip_distribution(df, decimals=2):
         price = round(row['close'], decimals)
         turnover = row['turnover_ratio'] / 100.0
         
-        # 衰减旧筹码
+        # 历史筹码衰减
         for p in list(chip_dict.keys()):
             chip_dict[p] = chip_dict[p] * (1.0 - turnover)
         
-        # 增加新筹码
+        # 新增筹码
         if price in chip_dict:
             chip_dict[price] += turnover
         else:
@@ -95,21 +96,21 @@ def get_chip_metrics(chip_df, current_price):
     return profit_ratio, avg_cost, concentration_90, chip_df
 
 # ----------------------------------------------------------------------------- 
-# 3. Data Fetching (Akshare) - Document Compliant
+# 3. Data Fetching (Akshare) - 严格按照文档修复
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=600)
 def get_full_data(code, days):
     data_bundle = {}
     
-    # [Fix] 按照文档要求，计算 start_date 和 end_date
-    # 格式必须为 'YYYYMMDD' 字符串
+    # [文档修复点 1] 必须计算 start_date 和 end_date
+    # 格式要求：str 'YYYYMMDD'
     end_dt = datetime.datetime.now()
     start_dt = end_dt - datetime.timedelta(days=days)
     
     start_date_str = start_dt.strftime("%Y%m%d")
     end_date_str = end_dt.strftime("%Y%m%d")
 
-    # 内部重试函数，解决偶尔的连接断开问题
+    # 简单的重试装饰器
     def fetch_with_retry(func, retries=3, delay=1, **kwargs):
         for i in range(retries):
             try:
@@ -119,23 +120,26 @@ def get_full_data(code, days):
                 time.sleep(delay)
         return None
 
-    # --- K Line --- 
+    # --- K Line (历史行情) --- 
     try:
-        # [Fix] 传入时间参数，减少数据请求量，防止被封
+        # [文档修复点 2] 调用 stock_zh_a_hist 时传入所有必要参数
+        # 避免因数据量过大导致的 RemoteDisconnected
         df = fetch_with_retry(
             ak.stock_zh_a_hist,
             retries=3,
-            delay=2,
+            delay=1,
             symbol=code,
-            period="daily",
-            start_date=start_date_str,  # 新增参数
-            end_date=end_date_str,      # 新增参数
-            adjust="qfq"
+            period="daily",          # 文档要求: daily, weekly, monthly
+            start_date=start_date_str, # 文档要求: YYYYMMDD
+            end_date=end_date_str,     # 文档要求: YYYYMMDD
+            adjust="qfq"             # 文档要求: qfq, hfq, or empty
         )
         
         if df is None or df.empty:
-            return None, "Akshare returned empty data. Check if code is valid."
+            return None, "Akshare returned empty data. Check symbol validity."
             
+        # [文档修复点 3] 映射文档指定的返回列名
+        # 文档列名: 日期, 股票代码, 开盘, 收盘, 最高, 最低, 成交量, 成交额, 振幅, 涨跌幅, 涨跌额, 换手率
         rename_map = {
             '日期': 'trade_date',
             '开盘': 'open',
@@ -150,27 +154,23 @@ def get_full_data(code, days):
         df['trade_date'] = pd.to_datetime(df['trade_date'])
         df = df.sort_values('trade_date').reset_index(drop=True)
         
-        # 确保数据格式为数字
+        # 数据清洗
         cols = ['open', 'high', 'low', 'close', 'volume', 'turnover_ratio', 'pct_change']
         for c in cols:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
                 
-        # 计算均线
+        # 计算指标
         for ma in [5, 20, 60, 250]:
             df[f'MA{ma}'] = df['close'].rolling(window=ma).mean()
-            
-        # 计算MACD
         df['DIF'], df['DEA'], df['MACD'] = calculate_macd(df)
+        
         data_bundle['history'] = df
         
     except Exception as e:
-        err_msg = str(e)
-        if "RemoteDisconnected" in err_msg or "Connection aborted" in err_msg:
-            return None, "Connection blocked. Please try again or update akshare."
-        return None, f"Error K-Line: {err_msg}"
+        return None, f"Error K-Line (stock_zh_a_hist): {str(e)}"
 
-    # --- Chips (筹码分布) --- 
+    # --- Chips (筹码) --- 
     try:
         chip_raw_df = calc_chip_distribution(df)
         current_price = df.iloc[-1]['close']
@@ -182,11 +182,11 @@ def get_full_data(code, days):
         }
         data_bundle['chip_data'] = chip_final_df
     except Exception as e:
-        # 允许K线成功但筹码失败（例如数据太少）
+        # 如果K线成功但筹码计算失败，不阻断显示，只给默认值
         data_bundle['chip_metrics'] = {'profit_ratio':0, 'avg_cost':0, 'concentration_90':0}
         data_bundle['chip_data'] = pd.DataFrame()
 
-    # --- Financial (个股信息) --- 
+    # --- Financial (个股资料) --- 
     try:
         info_df = fetch_with_retry(ak.stock_individual_info_em, retries=3, symbol=code)
         info_dict = dict(zip(info_df['item'], info_df['value']))
@@ -194,7 +194,7 @@ def get_full_data(code, days):
     except Exception as e:
         data_bundle['financial'] = {}
 
-    # --- Realtime (实时价格) --- 
+    # --- Realtime (实时信息) --- 
     try:
         last_row = df.iloc[-1]
         data_bundle['realtime'] = {
@@ -210,22 +210,21 @@ def get_full_data(code, days):
 # ----------------------------------------------------------------------------- 
 # 4. Main UI
 # -----------------------------------------------------------------------------
-st.sidebar.title("Hunter V8.6")
-st.sidebar.caption("Document Compliant Ver")
+st.sidebar.title("Hunter V8.7")
+st.sidebar.caption("EastMoney Fixed")
 st.sidebar.markdown("---")
-input_code = st.sidebar.text_input("Code (6 digits)", value="603909")
-lookback_days = st.sidebar.slider("Days Lookback", 200, 1000, 500)
+input_code = st.sidebar.text_input("Code (6 digits)", value="603777") # 使用文档示例代码
+lookback_days = st.sidebar.slider("Lookback Days", 100, 1000, 365)
 st.sidebar.markdown("### Risk Check")
 risk_check = st.sidebar.radio("Unlock Risk", ["Safe", "Risk"], index=0)
 risk_notes = st.sidebar.text_area("Notes", placeholder="Notes here...")
 
 if st.sidebar.button("Launch", type="primary"):
-    with st.spinner(f'Fetching Data (Last {lookback_days} days)...'):
+    with st.spinner('Fetching Data from EastMoney...'):
         data, err = get_full_data(input_code, lookback_days)
     
     if err:
         st.error(f"❌ {err}")
-        st.info("Tip: Try clicking 'Launch' again. If it fails repeatedly, check network or update akshare.")
     else:
         hist_df = data['history']
         rt_data = data['realtime']
@@ -239,20 +238,21 @@ if st.sidebar.button("Launch", type="primary"):
         pct_change = rt_data.get('change_pct', 0)
         
         try:
-            pct_val = float(pct_change)
-            color_change = "red" if pct_val > 0 else ("green" if pct_val < 0 else "black")
+            val = float(pct_change)
+            color = "red" if val > 0 else ("green" if val < 0 else "black")
         except:
-            color_change = "black"
+            color = "black"
 
         c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
         with c1:
             st.metric("Name", f"{name} ({input_code})")
         with c2:
-            st.markdown(f"#### Price: <span style='color:{color_change}'>{price}</span>", unsafe_allow_html=True)
+            st.markdown(f"#### Price: <span style='color:{color}'>{price}</span>", unsafe_allow_html=True)
         with c3:
-            st.markdown(f"#### Change: <span style='color:{color_change}'>{pct_change}%</span>", unsafe_allow_html=True)
+            st.markdown(f"#### Change: <span style='color:{color}'>{pct_change}%</span>", unsafe_allow_html=True)
         with c4:
-            st.metric("Industry", fin_data.get('行业', '-'))
+            industry = fin_data.get('行业', '-')
+            st.metric("Industry", industry)
             
         st.markdown("---")
         
@@ -266,29 +266,22 @@ if st.sidebar.button("Launch", type="primary"):
             pe = fin_data.get('市盈率(动)', fin_data.get('市盈率(TTM)', '-'))
             st.metric("PE Ratio", f"{pe}")
         with m4:
-            val = fin_data.get('总市值', '-')
-            if isinstance(val, (int, float)):
-                val = f"{val/100000000:.2f}亿"
-            st.metric("Market Cap", f"{val}")
+            mcap = fin_data.get('总市值', '-')
+            if isinstance(mcap, (int, float)):
+                mcap = f"{mcap/100000000:.2f}亿"
+            st.metric("Market Cap", f"{mcap}")
             
         # Download
         export_df = hist_df.copy()
         export_df['export_time'] = get_beijing_time()
-        export_df['risk_status'] = risk_check
         export_df['risk_notes'] = risk_notes
         csv = export_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="Download CSV",
-            data=csv,
-            file_name=f"Stock_{input_code}.csv",
-            mime="text/csv"
-        )
+        st.download_button("Download CSV", csv, f"Stock_{input_code}.csv", "text/csv")
         
         # Tabs
         tab1, tab2 = st.tabs(["K-Line", "Chips"])
         with tab1:
             fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-            
             fig_k.add_trace(go.Candlestick(
                 x=hist_df['trade_date'],
                 open=hist_df['open'], high=hist_df['high'],
@@ -302,7 +295,7 @@ if st.sidebar.button("Launch", type="primary"):
                         x=hist_df['trade_date'], y=hist_df[f'MA{ma}'],
                         mode='lines', name=f'MA{ma}', line=dict(color=color, width=1)
                     ), row=1, col=1)
-                    
+            
             vol_colors = ['red' if r['close'] >= r['open'] else 'green' for i, r in hist_df.iterrows()]
             fig_k.add_trace(go.Bar(
                 x=hist_df['trade_date'], y=hist_df['volume'],
@@ -321,20 +314,17 @@ if st.sidebar.button("Launch", type="primary"):
                 fig_chip = go.Figure()
                 fig_chip.add_trace(go.Bar(
                     y=chip_prof['price'], x=chip_prof['volume'],
-                    orientation='h', name='获利盘 (Profit)',
-                    marker_color='red', opacity=0.6
+                    orientation='h', name='Profit', marker_color='red', opacity=0.6
                 ))
                 fig_chip.add_trace(go.Bar(
                     y=chip_loss['price'], x=chip_loss['volume'],
-                    orientation='h', name='套牢盘 (Loss)', 
-                    marker_color='green', opacity=0.6
+                    orientation='h', name='Loss', marker_color='green', opacity=0.6
                 ))
-                fig_chip.add_hline(y=cur_p, line_dash="dash", line_color="black", annotation_text=f"Current: {cur_p}")
+                fig_chip.add_hline(y=cur_p, line_dash="dash", annotation_text=f"Price: {cur_p}")
                 fig_chip.update_layout(
-                    title=f"筹码分布 (Chip Distribution) - {name}",
-                    xaxis_title="占比", yaxis_title="价格",
+                    title=f"Chip Distribution - {name}",
                     height=600, bargap=0.0, hovermode="y unified"
                 )
                 st.plotly_chart(fig_chip, use_container_width=True)
             else:
-                st.warning("Not enough data to calculate chip distribution.")
+                st.warning("No chip data available.")
