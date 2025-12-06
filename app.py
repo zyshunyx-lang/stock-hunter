@@ -251,7 +251,7 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             label="📥 下载全息情报包 (.csv)",
             data=csv,
             file_name=f"Hunter_Report_{input_code}_{bj_time.strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv"，
+            mime="text/csv",
         )
 
         tab1, tab2 = st.tabs(["📊 K线技术分析", "🧩 筹码分布模拟"])
@@ -322,6 +322,7 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
 
 else:
     st.info("👈 请在左侧输入股票代码并点击【启动分析引擎】")
+
 
 
 
