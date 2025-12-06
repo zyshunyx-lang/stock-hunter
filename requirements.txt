@@ -1,4 +1,4 @@
 streamlit
-adata
+yfinance
 pandas
 plotly
