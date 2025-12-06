@@ -2,6 +2,6 @@ streamlit
 pandas
 numpy
 plotly
-akshare
+akshare>=1.13.0
 pytz
 requests
