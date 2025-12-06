@@ -1,5 +1,5 @@
 import streamlit as st
-import adata
+import yfinance as yf
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -9,254 +9,168 @@ import io
 # ==========================================
 # 1. 页面配置
 # ==========================================
-st.set_page_config(page_title="猎人指挥中心 V6.0 (adata版)", layout="wide", page_icon="🦅")
+st.set_page_config(page_title="猎人指挥中心 V7.0 (国际版)", layout="wide", page_icon="🦅")
 
 # --- 侧边栏 ---
 st.sidebar.header("🎯 目标锁定")
 stock_code = st.sidebar.text_input("输入代码 (如 603909)", value="603909")
-lookback_days = st.sidebar.slider("K线回看天数", min_value=200, max_value=1000, value=500)
+lookback_days = st.sidebar.slider("K线回看天数", min_value=120, max_value=1000, value=500)
 
 st.sidebar.markdown("---")
-st.sidebar.success("✅ 数据源已切换为 adata (多源融合/抗干扰)")
-st.sidebar.info("自动筹码算法已就绪，无需手动录入。")
+st.sidebar.header("🕵️‍♂️ 情报补全 (雅虎查不到的)")
+# 雅虎只有行情，没有A股特色的数据，需要你填
+turnover_rate = st.sidebar.number_input("换手率 (%)", value=0.0, help="看一眼软件填入")
+total_mv = st.sidebar.number_input("总市值 (亿)", value=0.0)
+chip_profit = st.sidebar.number_input("获利比例 (%)", value=85.0)
+avg_cost = st.sidebar.number_input("平均成本 (元)", value=0.0)
+chip_conc_70 = st.sidebar.number_input("70% 集中度 (%)", value=15.0)
+chip_conc_90 = st.sidebar.number_input("90% 集中度 (%)", value=30.0)
 
-# 风险排查 (adata 目前主要专注行情，公告类数据较少，保留人工通道)
-risk_status = st.sidebar.radio("未来30天解禁/减持(人工确认)：", ("✅ 安全", "⚠️ 有风险"), index=0)
+risk_status = st.sidebar.radio("未来30天解禁/减持：", ("✅ 安全", "⚠️ 有风险"), index=0)
 risk_detail = st.sidebar.text_input("风险备注", value="")
 
 # ==========================================
-# 2. 核心算法：筹码分布 (CYQ)
-# ==========================================
-def calc_chip_distribution(df):
-    """
-    根据历史K线和换手率，模拟计算筹码分布
-    """
-    # adata返回的列名通常是: trade_date, open, close, low, high, volume, amount, turnover_ratio
-    # 我们需要标准化列名
-    if 'turnover_ratio' not in df.columns:
-        # 如果没有换手率，尝试用成交量模拟 (粗略)
-        df['turnover_ratio'] = 1.0 # 默认值，防止报错
-        
-    chip_dict = {} 
-    
-    for index, row in df.iterrows():
-        price = round(row['close'], 2)
-        turnover = row['turnover_ratio'] / 100 
-        
-        if turnover <= 0: turnover = 0.001
-        if turnover > 1: turnover = 1.0
-        
-        # 历史筹码衰减
-        for p in list(chip_dict.keys()):
-            chip_dict[p] = chip_dict[p] * (1 - turnover)
-            
-        # 新增筹码
-        if price in chip_dict:
-            chip_dict[price] += turnover
-        else:
-            chip_dict[price] = turnover
-            
-    # 统计指标
-    chips = pd.DataFrame(list(chip_dict.items()), columns=['Price', 'Volume'])
-    chips = chips.sort_values('Price')
-    total_volume = chips['Volume'].sum()
-    
-    if total_volume == 0: return None
-    
-    chips['CumVolume'] = chips['Volume'].cumsum()
-    chips['CumPercent'] = chips['CumVolume'] / total_volume
-    current_price = df.iloc[-1]['close']
-    
-    # 获利比例
-    profit_chips = chips[chips['Price'] < current_price]['Volume'].sum()
-    profit_ratio = (profit_chips / total_volume) * 100
-    
-    # 平均成本
-    avg_cost = (chips['Price'] * chips['Volume']).sum() / total_volume
-    
-    # 集中度
-    try:
-        p05 = chips[chips['CumPercent'] >= 0.05].iloc[0]['Price']
-        p95 = chips[chips['CumPercent'] >= 0.95].iloc[0]['Price']
-        conc_90 = (p95 - p05) / (p95 + p05) * 100
-        
-        p15 = chips[chips['CumPercent'] >= 0.15].iloc[0]['Price']
-        p85 = chips[chips['CumPercent'] >= 0.85].iloc[0]['Price']
-        conc_70 = (p85 - p15) / (p85 + p15) * 100
-    except:
-        conc_90 = 0
-        conc_70 = 0
-    
-    return {
-        "profit_ratio": round(profit_ratio, 2),
-        "avg_cost": round(avg_cost, 2),
-        "conc_90": round(conc_90, 2),
-        "conc_70": round(conc_70, 2),
-        "chip_data": chips
-    }
-
-# ==========================================
-# 3. 数据获取层 (adata 驱动)
+# 2. 核心数据获取 (Yahoo Finance)
 # ==========================================
 
 @st.cache_data(ttl=60)
-def get_market_data_adata(code, days):
+def get_data_yfinance(code, days):
+    """
+    使用雅虎财经接口，专治各种网络不服
+    """
     try:
-        # 1. 获取历史K线 (adata 自动融合多源)
-        start_date = (datetime.datetime.now() - datetime.timedelta(days=days*1.5)).strftime("%Y-%m-%d")
-        # k_type=1 (日线)
-        df = adata.stock.market.get_market(stock_code=code, start_date=start_date, k_type=1)
+        # 1. 转换代码格式 (A股 -> 雅虎格式)
+        # 60xxxx -> 60xxxx.SS (上海)
+        # 00xxxx, 30xxxx -> xxxxxx.SZ (深圳)
+        if code.startswith('6'):
+            symbol = f"{code}.SS"
+        else:
+            symbol = f"{code}.SZ"
+            
+        # 2. 获取数据
+        ticker = yf.Ticker(symbol)
         
-        if df is None or df.empty:
-            return None, "adata 返回 K线数据为空"
+        # 历史K线
+        # period='2y' 代表拿2年数据
+        df = ticker.history(period="2y")
+        
+        if df.empty:
+            return None, "雅虎返回数据为空，请检查代码"
+            
+        # 3. 数据清洗
+        df = df.reset_index()
+        # 雅虎的列名: Date, Open, High, Low, Close, Volume, Dividends, Stock Splits
+        df = df.rename(columns={'Date':'Date', 'Open':'Open', 'High':'High', 'Low':'Low', 'Close':'Close', 'Volume':'Volume'})
+        
+        # 去掉时区信息，防止报错
+        df['Date'] = df['Date'].dt.tz_localize(None)
+        
+        # 截取用户需要的天数
+        df = df.tail(days)
 
-        # 标准化列名以适配后续计算
-        # adata返回: stock_code, trade_time, trade_date, open, close, high, low, volume, amount, turnover_ratio
-        df['trade_date'] = pd.to_datetime(df['trade_date'])
-        df = df.sort_values('trade_date')
+        # 4. 计算指标
+        df['MA5'] = df['Close'].rolling(5).mean()
+        df['MA20'] = df['Close'].rolling(20).mean()
+        df['MA60'] = df['Close'].rolling(60).mean()
+        df['MA250'] = df['Close'].rolling(250).mean()
         
-        # 2. 计算均线 & MACD
-        df['MA5'] = df['close'].rolling(5).mean()
-        df['MA20'] = df['close'].rolling(20).mean()
-        df['MA60'] = df['close'].rolling(60).mean()
-        df['MA250'] = df['close'].rolling(250).mean()
-        
-        exp12 = df['close'].ewm(span=12, adjust=False).mean()
-        exp26 = df['close'].ewm(span=26, adjust=False).mean()
+        exp12 = df['Close'].ewm(span=12, adjust=False).mean()
+        exp26 = df['Close'].ewm(span=26, adjust=False).mean()
         df['DIF'] = exp12 - exp26
         df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
         df['MACD'] = 2 * (df['DIF'] - df['DEA'])
         
-        # 3. 计算筹码
-        chip_info = calc_chip_distribution(df)
-        
-        # 4. 获取实时行情 (Snaphot)
-        # adata.stock.market.list_market_current 实际上可以取到最新价
-        current_df = adata.stock.market.list_market_current(stock_code=code)
-        
-        if not current_df.empty:
-            curr = current_df.iloc[0]
-            base_info = {
-                "代码": code,
-                "名称": curr.get('short_name', code),
-                "现价": curr.get('price', df.iloc[-1]['close']),
-                "涨跌幅": f"{curr.get('change_pct', 0)}%",
-                "换手率": f"{curr.get('turnover_ratio', 0)}%",
-                "成交量": curr.get('volume', 0),
-                "总市值": f"{round(curr.get('total_market_value', 0)/1e8, 2)}亿" if 'total_market_value' in curr else "--"
-            }
+        # 5. 获取实时信息 (雅虎的 info 有时很慢，我们直接用K线最后一行)
+        latest = df.iloc[-1]
+        # 计算涨跌幅 (今天收盘 - 昨天收盘) / 昨天收盘
+        if len(df) > 1:
+            prev = df.iloc[-2]['Close']
+            curr = latest['Close']
+            pct = (curr - prev) / prev * 100
         else:
-            # 兜底：如果实时取不到，用K线最后一行
-            last = df.iloc[-1]
-            base_info = {
-                "代码": code,
-                "名称": code, # adata K线不带名字
-                "现价": last['close'],
-                "涨跌幅": "--", # K线里不一定有当天实时的涨跌幅
-                "换手率": f"{last['turnover_ratio']}%",
-                "总市值": "--" 
-            }
+            pct = 0
             
-        return df.tail(days), base_info, chip_info
+        base_info = {
+            "代码": code,
+            "名称": f"Code {code}", # 雅虎中文名支持不好，直接显示代码
+            "现价": round(latest['Close'], 2),
+            "涨跌幅": f"{pct:.2f}%",
+            "成交量": latest['Volume']
+        }
+        
+        return df, base_info
 
     except Exception as e:
-        return None, f"adata 运行异常: {str(e)}"
+        return None, f"雅虎接口报错: {str(e)}"
 
-# ==========================================
-# 4. CSV生成器
-# ==========================================
-def create_full_csv(df, base_info, chip_info, user_risk):
+# --- CSV生成 ---
+def create_csv_file(df, base_info, user_inputs):
     output = io.StringIO()
-    output.write("=== 🦅 猎人指挥中心 V6.0 (adata版) ===\n")
+    output.write("=== 🦅 猎人指挥中心 V7.0 (国际版) ===\n")
     output.write(f"生成时间,{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
     
     output.write("\n--- 🟢 实时行情 ---\n")
-    for k, v in base_info.items():
+    output.write(f"代码,{base_info['代码']}\n")
+    output.write(f"现价,{base_info['现价']}\n")
+    output.write(f"涨跌幅,{base_info['涨跌幅']}\n")
+    
+    output.write("\n--- 🕵️‍♂️ 人工补全情报 ---\n")
+    for k, v in user_inputs.items():
         output.write(f"{k},{v}\n")
-        
-    output.write("\n--- 🤖 AI算出的底牌 (adata驱动) ---\n")
-    if chip_info:
-        output.write(f"获利比例,{chip_info['profit_ratio']}%\n")
-        output.write(f"平均成本,{chip_info['avg_cost']}\n")
-        output.write(f"70%集中度,{chip_info['conc_70']}%\n")
-        output.write(f"90%集中度,{chip_info['conc_90']}%\n")
     
-    output.write("\n--- 🕵️‍♂️ 风险排查 ---\n")
-    output.write(f"风险状态,{user_risk['status']}\n")
-    output.write(f"备注,{user_risk['detail']}\n")
-    
-    output.write("\n--- 📈 历史数据流 ---\n")
+    output.write("\n--- 📈 历史K线数据 ---\n")
     df.to_csv(output, index=False)
     
     return output.getvalue().encode('utf-8-sig')
 
 # ==========================================
-# 5. 主界面逻辑
+# 3. 主界面
 # ==========================================
 if stock_code:
-    with st.spinner('📡 adata 正在从多源聚合数据...'):
-        res = get_market_data_adata(stock_code, lookback_days)
+    with st.spinner('🛰️ 正在通过国际专线连接...'):
+        res = get_data_yfinance(stock_code, lookback_days)
     
     if res and res[0] is not None:
-        df, base_info, chip_info = res
+        df, base_info = res
         
         # --- 标题区 ---
         c1, c2 = st.columns([3, 1])
         with c1:
-            st.title(f"{base_info['名称']} ({stock_code})")
-            st.caption(f"总市值: {base_info['总市值']}")
+            st.title(f"股票代码: {stock_code}")
+            st.caption("数据源: Yahoo Finance (国际接口)")
         with c2:
             try:
-                pct = float(base_info['涨跌幅'].replace('%', ''))
-                color = "red" if pct > 0 else "green"
+                pct_val = float(base_info['涨跌幅'].replace('%', ''))
+                color = "red" if pct_val > 0 else "green"
             except:
                 color = "black"
             st.markdown(f"## <span style='color:{color}'>{base_info['现价']}</span>", unsafe_allow_html=True)
             st.markdown(f"**{base_info['涨跌幅']}**")
 
-        # --- 筹码看板 ---
-        st.markdown("### 🤖 筹码分布 (AI自动计算)")
-        if chip_info:
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("获利比例", f"{chip_info['profit_ratio']}%")
-            k2.metric("平均成本", f"{chip_info['avg_cost']}")
-            k3.metric("70%集中度", f"{chip_info['conc_70']}%")
-            k4.metric("90%集中度", f"{chip_info['conc_90']}%")
-            
-            # 筹码可视化
-            chip_df = chip_info['chip_data']
-            chip_df = chip_df[chip_df['Volume'] > 0.001]
-            fig_chip = go.Figure()
-            fig_chip.add_trace(go.Bar(
-                y=chip_df['Price'], x=chip_df['Volume'], 
-                orientation='h', 
-                marker_color=['red' if p < float(base_info['现价']) else 'green' for p in chip_df['Price']],
-                name='筹码'
-            ))
-            fig_chip.update_layout(title="筹码分布模拟图", height=300, margin=dict(l=10, r=10, t=30, b=10))
-            fig_chip.add_hline(y=float(base_info['现价']), line_dash="dash", line_color="black")
-            st.plotly_chart(fig_chip, use_container_width=True)
-
-        # --- 五档盘口 (adata 特色功能) ---
-        with st.expander("📊 查看实时五档盘口 (adata直连)", expanded=False):
-            try:
-                # 获取五档行情
-                five_df = adata.stock.market.get_market_five(stock_code=stock_code)
-                if not five_df.empty:
-                    st.dataframe(five_df)
-                else:
-                    st.warning("暂无五档盘口数据 (可能是非交易时间)")
-            except:
-                st.warning("五档行情连接超时")
+        # --- 核心指标 (人工填写的) ---
+        i1, i2, i3, i4 = st.columns(4)
+        i1.metric("换手率 (人工)", f"{turnover_rate}%")
+        i2.metric("总市值 (人工)", f"{total_mv}亿")
+        i3.metric("获利比例 (人工)", f"{chip_profit}%")
+        i4.metric("风险状态", "有雷" if "有风险" in risk_status else "安全")
 
         # --- 下载按钮 ---
         now_str = datetime.datetime.now().strftime("%Y%m%d%H%M")
-        file_name = f"{base_info['名称']}_{stock_code}_{now_str}.csv"
-        user_risk = {"status": risk_status, "detail": risk_detail}
-        csv_data = create_full_csv(df, base_info, chip_info, user_risk)
+        file_name = f"Stock_{stock_code}_{now_str}.csv"
+        
+        user_inputs = {
+            "换手率": f"{turnover_rate}%",
+            "总市值": f"{total_mv}亿",
+            "获利比例": f"{chip_profit}%",
+            "平均成本": avg_cost,
+            "70%集中度": f"{chip_conc_70}%",
+            "风险": f"{risk_status} {risk_detail}"
+        }
+        
+        csv_data = create_csv_file(df, base_info, user_inputs)
         
         st.download_button(
-            label=f"📥 下载情报包 (.csv)",
+            label="📥 下载情报包 (.csv)",
             data=csv_data,
             file_name=file_name,
             mime="text/csv",
@@ -264,15 +178,15 @@ if stock_code:
             use_container_width=True
         )
 
-        # --- K线图表 ---
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], subplot_titles=("K线", "成交量"))
-        fig.add_trace(go.Candlestick(x=df['trade_date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='K线'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['trade_date'], y=df['MA20'], line=dict(color='purple', width=1.5), name='MA20'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['trade_date'], y=df['MA60'], line=dict(color='blue', width=1.5), name='MA60'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['trade_date'], y=df['MA250'], line=dict(color='orange', width=1.5), name='MA250'), row=1, col=1)
-        fig.add_trace(go.Bar(x=df['trade_date'], y=df['volume'], name='成交量'), row=2, col=1)
+        # --- 图表区 ---
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3], subplot_titles=("K线与均线", "成交量"))
+        fig.add_trace(go.Candlestick(x=df['Date'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K线'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MA20'], line=dict(color='purple', width=1.5), name='MA20'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MA60'], line=dict(color='blue', width=1.5), name='MA60'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['Date'], y=df['MA250'], line=dict(color='orange', width=1.5), name='MA250'), row=1, col=1)
+        fig.add_trace(go.Bar(x=df['Date'], y=df['Volume'], name='成交量'), row=2, col=1)
         fig.update_layout(height=600, xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
 
     else:
-        st.error(f"❌ 获取失败: {base_info}")
+        st.error(f"❌ 获取失败: {res[1] if res else '未知错误'}")
