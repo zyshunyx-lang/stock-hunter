@@ -1,4 +1,4 @@
 streamlit
-akshare
+adata
 pandas
 plotly
