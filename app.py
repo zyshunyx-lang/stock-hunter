@@ -288,18 +288,18 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
         with tab1:
             # K线图配置
             fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                  vertical_spacing=0.03, row_heights=[0.7， 0.3])
+                                  vertical_spacing=0.03, row_heights=[0.7, 0.3])
             
             fig_k.add_trace(go.Candlestick(
-                x=hist_df['trade_date']，
-                open=hist_df['open'], high=hist_df['high']，
-                low=hist_df['low'], close=hist_df['close']，
+                x=hist_df['trade_date'],
+                open=hist_df['open'], high=hist_df['high'],
+                low=hist_df['low'], close=hist_df['close'],
                 name='K线'
             ), row=1, col=1)
             
             colors = {'MA5': 'orange', 'MA20': 'purple', 'MA60': 'blue', 'MA250': 'black'}
             for ma_name, color in colors.items():
-                if ma_name 在 hist_df.columns:
+                if ma_name in hist_df.columns:
                     fig_k.add_trace(go.Scatter(
                         x=hist_df['trade_date'], y=hist_df[ma_name],
                         mode='lines', name=ma_name, line=dict(color=color, width=1)
@@ -307,7 +307,7 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             
             vol_colors = ['red' if r['close'] >= r['open'] else 'green' for i, r in hist_df.iterrows()]
             fig_k.add_trace(go.Bar(
-                x=hist_df['trade_date'], y=hist_df['volume']，
+                x=hist_df['trade_date'], y=hist_df['volume'],
                 name='成交量', marker_color=vol_colors
             ), row=2, col=1)
 
@@ -323,12 +323,12 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             fig_chip = go.Figure()
             
             fig_chip.add_trace(go.Bar(
-                y=chip_profit['price'], x=chip_profit['volume']，
+                y=chip_profit['price'], x=chip_profit['volume'],
                 orientation='h', name='获利盘', marker_color='red', opacity=0.6
             ))
             
             fig_chip.add_trace(go.Bar(
-                y=chip_loss['price'], x=chip_loss['volume']，
+                y=chip_loss['price'], x=chip_loss['volume'],
                 orientation='h', name='套牢盘', marker_color='green', opacity=0.6
             ))
             
@@ -336,9 +336,9 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             
             fig_chip.update_layout(
                 title="筹码成本分布 (Chip Distribution)"，
-                xaxis_title="筹码量 (相对比例)"，
+                xaxis_title="筹码量 (相对比例)",
                 yaxis_title="价格"，
-                height=600，
+                height=600,
                 bargap=0.0, 
                 showlegend=True
             )
