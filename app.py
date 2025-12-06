@@ -11,22 +11,24 @@ import random
 # 0. 全局配置
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Hunter Data Fetcher Pro",
-    page_icon="🏹",
+    page_title="Hunter Data Fetcher (Lite)",
+    page_icon="📉",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # ----------------------------------------------------------------------------- 
-# 1. 辅助与清洗函数
+# 1. 核心辅助函数
 # -----------------------------------------------------------------------------
 def get_symbol_prefix(code):
+    """自动补充代码前缀"""
     if code.startswith('6'): return f"sh{code}"
     if code.startswith('0') or code.startswith('3'): return f"sz{code}"
     if code.startswith('8') or code.startswith('4'): return f"bj{code}"
     return code
 
 def calculate_macd(df, short=12, long=26, mid=9):
+    """计算 MACD 指标"""
     close = df['close']
     ema12 = close.ewm(span=short, adjust=False).mean()
     ema26 = close.ewm(span=long, adjust=False).mean()
@@ -36,6 +38,7 @@ def calculate_macd(df, short=12, long=26, mid=9):
     return dif, dea, macd
 
 def clean_data(df, col_map):
+    """标准化数据列名"""
     df = df.rename(columns=col_map)
     if 'trade_date' in df.columns:
         df['trade_date'] = pd.to_datetime(df['trade_date'])
@@ -46,7 +49,41 @@ def clean_data(df, col_map):
     return df
 
 # ----------------------------------------------------------------------------- 
-# 2. 数据获取逻辑 (5端口轮询)
+# 2. 名称获取专用逻辑 (解决名称显示问题)
+# -----------------------------------------------------------------------------
+@st.cache_data(ttl=3600) # 缓存1小时，避免重复请求
+def get_all_stock_names_map():
+    """
+    获取全市场股票代码-名称映射表。
+    相比单独请求个股信息，这种方式虽然第一次慢几秒，但后续查询极其稳定且快。
+    """
+    try:
+        # 接口：获取A股股票代码和简称列表
+        df = ak.stock_info_a_code_name()
+        # 将代码转换为字符串并统一格式（去除可能的空格）
+        df['code'] = df['code'].astype(str).str.strip()
+        return dict(zip(df['code'], df['name']))
+    except Exception:
+        return {}
+
+def get_stock_name_robust(code, name_map):
+    """多级保障获取股票名称"""
+    # 1. 优先从全市场缓存中查
+    if code in name_map:
+        return name_map[code]
+    
+    # 2. 如果缓存没查到（可能是新股），尝试请求个股资料
+    try:
+        df = ak.stock_individual_info_em(symbol=code)
+        info = dict(zip(df['item'], df['value']))
+        return info.get('股票简称', code)
+    except:
+        pass
+        
+    return code # 实在找不到，返回代码
+
+# ----------------------------------------------------------------------------- 
+# 3. 历史行情获取逻辑 (多源轮询)
 # -----------------------------------------------------------------------------
 def strategy_em(code, s, e):
     df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=s, end_date=e, adjust="qfq")
@@ -65,184 +102,131 @@ def strategy_tencent(code, s, e):
     if df is None or df.empty: raise ValueError("Empty")
     return clean_data(df, {'date': 'trade_date'})
 
-@st.cache_data(ttl=600)
-def get_stock_data(code, days):
-    data_bundle = {}
+@st.cache_data(ttl=300)
+def get_stock_history(code, days):
     logs = []
     
-    # 1. 获取基本面 (名称)
-    fin_info = {'name': code} # 默认值
-    try:
-        df_info = ak.stock_individual_info_em(symbol=code)
-        info_dict = dict(zip(df_info['item'], df_info['value']))
-        fin_info['name'] = info_dict.get('股票简称', code)
-        fin_info['industry'] = info_dict.get('行业', '-')
-        fin_info['mcap'] = info_dict.get('流通股本', None)
-        logs.append(f"✅ 获取名称成功: {fin_info['name']}")
-    except:
-        logs.append("⚠️ 无法获取股票名称")
-    
-    data_bundle['financial'] = fin_info
-
-    # 2. 获取行情
+    # 日期计算
     end_dt = datetime.datetime.now()
     start_dt = end_dt - datetime.timedelta(days=days)
     s_str, e_str = start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d")
     
+    # 轮询策略
     strategies = [("EastMoney", strategy_em), ("Sina", strategy_sina), ("Tencent", strategy_tencent)]
     
     df = None
     for name, func in strategies:
         try:
-            time.sleep(random.uniform(0.1, 0.5))
+            time.sleep(random.uniform(0.1, 0.3))
             temp_df = func(code, s_str, e_str)
             if temp_df is not None and not temp_df.empty:
                 df = temp_df
-                logs.append(f"✅ 行情源: {name}")
+                logs.append(f"✅ 数据源: {name}")
                 break
         except: continue
             
-    if df is None: return None, "无法获取数据，请检查代码。", logs
+    if df is None: 
+        return None, "无法获取历史数据，请检查代码或网络。", logs
     
-    # 3. 补全指标
-    for ma in [5, 10, 20, 60]: df[f'MA{ma}'] = df['close'].rolling(window=ma).mean()
+    # 补全指标
+    for ma in [5, 10, 20, 60]: 
+        df[f'MA{ma}'] = df['close'].rolling(window=ma).mean()
     df['DIF'], df['DEA'], df['MACD'] = calculate_macd(df)
     
-    # 补全元数据
+    # 补全基本信息列
     df['code'] = code
-    df['name'] = fin_info['name']
     
-    # 补全换手率
-    if 'turnover' not in df.columns:
-        mcap = fin_info.get('mcap')
-        df['turnover'] = (df['volume'] / float(mcap) * 100) if mcap else 0.0
-
-    data_bundle['history'] = df
-    
-    # 实时摘要
-    try:
-        last = df.iloc[-1]
-        pct = last.get('pct_change', 0)
-        if pct == 0 and len(df)>1: pct = (last['close'] - df.iloc[-2]['close']) / df.iloc[-2]['close'] * 100
-        data_bundle['realtime'] = {'price': last['close'], 'pct': pct, 'date': last['trade_date'].strftime("%Y-%m-%d")}
-    except:
-        data_bundle['realtime'] = {'price': 0, 'pct': 0, 'date': '-'}
-        
-    return data_bundle, None, logs
+    return df, None, logs
 
 # ----------------------------------------------------------------------------- 
-# 3. 侧边栏界面 (输入区)
+# 4. 用户界面 (极简版)
 # -----------------------------------------------------------------------------
-st.sidebar.title("Hunter Pro (Gemini专用)")
+st.sidebar.title("数据获取助手")
 st.sidebar.markdown("---")
 
-# 基础设置
-c1, c2 = st.sidebar.columns([1, 1])
-input_code = c1.text_input("代码", "603777")
-lookback = c2.number_input("回溯天数", 30, 1000, 365)
+# 1. 预加载全市场名称映射 (后台运行，静默加载)
+with st.spinner("正在初始化股票列表..."):
+    name_map = get_all_stock_names_map()
 
-# 尝试预加载名称（提升体验）
-if len(input_code) == 6:
-    st.sidebar.caption(f"当前分析对象: {input_code}")
+# 2. 输入区
+input_code = st.sidebar.text_input("股票代码", value="603777")
+lookback = st.sidebar.slider("查询回溯天数", 30, 1000, 365)
 
-st.sidebar.markdown("### ✍️ 筹码分布手动录入")
-st.sidebar.info("以下数据将作为【全时段参考值】写入文件，供Gemini判断主力状态。")
+# 实时显示名称预览
+current_name = get_stock_name_robust(input_code, name_map)
+if current_name != input_code:
+    st.sidebar.success(f"匹配股票: **{current_name}**")
+else:
+    st.sidebar.warning("未匹配到名称，请确认代码")
 
-# 分组1：整体持仓
-with st.sidebar.expander("1. 整体持仓与获利", expanded=True):
-    col_h1, col_h2 = st.columns(2)
-    hold_min = col_h1.number_input("持仓区间-低", 0.0, 1000.0, 6.90, step=0.1)
-    hold_max = col_h2.number_input("持仓区间-高", 0.0, 1000.0, 20.50, step=0.1)
-    profit_pct = st.number_input("获利持仓占比 (%)", 0.0, 100.0, 82.44, step=0.01)
-
-# 分组2：90%筹码
-with st.sidebar.expander("2. 90% 筹码分布", expanded=True):
-    col_90_1, col_90_2 = st.columns(2)
-    chip90_min = col_90_1.number_input("90%区间-低", 0.0, 1000.0, 8.40, step=0.1)
-    chip90_max = col_90_2.number_input("90%区间-高", 0.0, 1000.0, 15.90, step=0.1)
-    conc90 = st.number_input("90% 集中度", 0.0, 100.0, 30.86, step=0.01)
-
-# 分组3：70%筹码
-with st.sidebar.expander("3. 70% 筹码分布", expanded=True):
-    col_70_1, col_70_2 = st.columns(2)
-    chip70_min = col_70_1.number_input("70%区间-低", 0.0, 1000.0, 9.30, step=0.1)
-    chip70_max = col_70_2.number_input("70%区间-高", 0.0, 1000.0, 15.70, step=0.1)
-    conc70 = st.number_input("70% 集中度", 0.0, 100.0, 25.60, step=0.01)
-
-avg_cost = st.sidebar.number_input("平均/主力成本 (元)", value=0.0)
-
-# ----------------------------------------------------------------------------- 
-# 4. 主逻辑区
-# -----------------------------------------------------------------------------
-if st.button("生成分析文件", type="primary"):
-    with st.spinner(f"正在获取 {input_code} 数据..."):
-        data, err, logs = get_stock_data(input_code, lookback)
+st.sidebar.markdown("---")
+# 3. 查询按钮
+if st.sidebar.button("开始查询", type="primary"):
     
-    if err:
-        st.error(err)
+    if current_name == input_code:
+        st.error(f"❌ 无法识别代码 {input_code} 的中文名称，请检查输入。")
     else:
-        df = data['history']
-        rt = data['realtime']
-        stock_name = data['financial']['name']
+        with st.spinner(f"正在获取 【{current_name}】 的历史数据..."):
+            df, err, logs = get_stock_history(input_code, lookback)
         
-        # --- 注入手动数据 (关键步骤) ---
-        # 我们添加前缀 REF_ (Reference) 让 Gemini 知道这是参考数据
-        df['REF_Holding_Range'] = f"{hold_min}-{hold_max}"
-        df['REF_Profit_Ratio'] = profit_pct
-        df['REF_Cost90_Range'] = f"{chip90_min}-{chip90_max}"
-        df['REF_Conc90'] = conc90
-        df['REF_Cost70_Range'] = f"{chip70_min}-{chip70_max}"
-        df['REF_Conc70'] = conc70
-        
-        if avg_cost > 0:
-            df['REF_Avg_Cost'] = avg_cost
+        if err:
+            st.error(err)
+        else:
+            # 注入名称到 DataFrame
+            df['name'] = current_name
             
-        # 增加一列提示，专门给 Gemini 看
-        df['GEMINI_NOTE'] = "Columns starting with 'REF_' are STATIC manual inputs representing the chip distribution state at the end of period. They apply to the whole dataset."
-
-        # --- 界面展示 ---
-        st.success(f"数据获取成功: {stock_name}")
-        
-        # 顶部指标
-        k1, k2, k3 = st.columns(3)
-        color = "red" if rt['pct'] > 0 else "green"
-        k1.metric("股票名称", f"{stock_name}")
-        k2.markdown(f"#### 现价: <span style='color:{color}'>{rt['price']}</span>", unsafe_allow_html=True)
-        k3.markdown(f"#### 涨幅: <span style='color:{color}'>{rt['pct']:.2f}%</span>", unsafe_allow_html=True)
-        
-        st.markdown("---")
-
-        # --- 下载功能 ---
-        # 文件名格式: 【股票名称+时间】.csv
-        file_time = datetime.datetime.now().strftime("%Y%m%d")
-        file_name = f"【{stock_name}_{file_time}】.csv"
-        csv_data = df.to_csv(index=False).encode('utf-8-sig')
-        
-        st.download_button(
-            label=f"📥 下载分析文件: {file_name}",
-            data=csv_data,
-            file_name=file_name,
-            mime="text/csv",
-            type="primary"
-        )
-        
-        st.info("💡 提示：此文件已包含你录入的所有筹码参数。请直接上传给 Gemini，并提示它‘参考 REF_ 开头的列进行筹码分析’。")
-
-        # --- 简单预览 ---
-        with st.expander("📊 K线预览"):
-            fig = go.Figure()
-            fig.add_trace(go.Candlestick(x=df['trade_date'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='K线'))
-            for ma in [20, 60]: 
-                if f'MA{ma}' in df: fig.add_trace(go.Scatter(x=df['trade_date'], y=df[f'MA{ma}'], line=dict(width=1), name=f'MA{ma}'))
+            # 界面展示
+            st.success(f"获取成功: {current_name} ({input_code})")
             
-            # 画出筹码区间辅助线 (如果合理)
-            if chip90_min > 0 and chip90_max > 0:
-                fig.add_hrect(y0=chip90_min, y1=chip90_max, line_width=0, fillcolor="red", opacity=0.1, annotation_text="90%筹码区")
+            # 获取最新数据用于展示
+            last_row = df.iloc[-1]
+            last_date = last_row['trade_date'].strftime("%Y-%m-%d")
+            close_price = last_row['close']
             
-            fig.update_layout(height=400, xaxis_rangeslider_visible=False, margin=dict(t=0, b=0, l=0, r=0))
-            st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("查看数据样本"):
-            # 只显示最后几行，让用户确认手动数据已注入
-            cols_to_show = ['trade_date', 'close', 'REF_Profit_Ratio', 'REF_Conc90', 'GEMINI_NOTE']
-            st.dataframe(df[cols_to_show].tail(3), use_container_width=True)
+            # 计算简单的涨跌幅展示
+            pct_display = 0.0
+            if 'pct_change' in df.columns:
+                pct_display = last_row['pct_change']
+            elif len(df) > 1:
+                prev_close = df.iloc[-2]['close']
+                pct_display = (close_price - prev_close) / prev_close * 100
+                
+            color = "red" if pct_display > 0 else "green"
+            
+            # 顶部指标栏
+            c1, c2, c3 = st.columns(3)
+            c1.metric("股票名称", current_name)
+            c2.markdown(f"#### 收盘价: <span style='color:{color}'>{close_price}</span>", unsafe_allow_html=True)
+            c3.markdown(f"#### 日期: {last_date}", unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # --- 关键修改：文件下载 ---
+            # 格式: 【股票中文名称_时间】.csv
+            # 时间格式建议用 YYYYMMDD，避免冒号等非法字符
+            file_time = datetime.datetime.now().strftime("%Y%m%d")
+            file_name = f"【{current_name}_{file_time}】.csv"
+            
+            csv_data = df.to_csv(index=False).encode('utf-8-sig')
+            
+            st.download_button(
+                label=f"📥 下载数据: {file_name}",
+                data=csv_data,
+                file_name=file_name,
+                mime="text/csv",
+                type="primary"
+            )
+            
+            # 预览图表
+            with st.expander("📊 数据预览", expanded=True):
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(
+                    x=df['trade_date'], open=df['open'], high=df['high'], 
+                    low=df['low'], close=df['close'], name='K线'
+                ))
+                for ma in [20, 60]:
+                    if f'MA{ma}' in df:
+                        fig.add_trace(go.Scatter(x=df['trade_date'], y=df[f'MA{ma}'], line=dict(width=1), name=f'MA{ma}'))
+                
+                fig.update_layout(height=450, xaxis_rangeslider_visible=False, title=f"{current_name} K线走势")
+                st.plotly_chart(fig, use_container_width=True)
