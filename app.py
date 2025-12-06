@@ -11,8 +11,8 @@ import random
 # 0. 全局配置
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Hunter Data Fetcher (Lite)",
-    page_icon="📉",
+    page_title="Hunter Data Fetcher (Smart)",
+    page_icon="🔎",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -21,7 +21,8 @@ st.set_page_config(
 # 1. 核心辅助函数
 # -----------------------------------------------------------------------------
 def get_symbol_prefix(code):
-    """自动补充代码前缀"""
+    """自动补充代码前缀 (用于新浪/腾讯接口)"""
+    if not code or not isinstance(code, str): return code
     if code.startswith('6'): return f"sh{code}"
     if code.startswith('0') or code.startswith('3'): return f"sz{code}"
     if code.startswith('8') or code.startswith('4'): return f"bj{code}"
@@ -49,38 +50,60 @@ def clean_data(df, col_map):
     return df
 
 # ----------------------------------------------------------------------------- 
-# 2. 名称获取专用逻辑 (解决名称显示问题)
+# 2. 智能名称搜索逻辑 (双向索引 + 强制回退)
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=3600) # 缓存1小时，避免重复请求
-def get_all_stock_names_map():
+@st.cache_data(ttl=3600)
+def get_market_maps():
     """
-    获取全市场股票代码-名称映射表。
-    相比单独请求个股信息，这种方式虽然第一次慢几秒，但后续查询极其稳定且快。
+    获取全市场映射表 (代码->名称, 名称->代码)
     """
+    code2name = {}
+    name2code = {}
     try:
-        # 接口：获取A股股票代码和简称列表
+        # 尝试接口 1: A股列表
         df = ak.stock_info_a_code_name()
-        # 将代码转换为字符串并统一格式（去除可能的空格）
         df['code'] = df['code'].astype(str).str.strip()
-        return dict(zip(df['code'], df['name']))
+        df['name'] = df['name'].astype(str).str.strip()
+        code2name = dict(zip(df['code'], df['name']))
+        name2code = dict(zip(df['name'], df['code']))
     except Exception:
-        return {}
-
-def get_stock_name_robust(code, name_map):
-    """多级保障获取股票名称"""
-    # 1. 优先从全市场缓存中查
-    if code in name_map:
-        return name_map[code]
-    
-    # 2. 如果缓存没查到（可能是新股），尝试请求个股资料
-    try:
-        df = ak.stock_individual_info_em(symbol=code)
-        info = dict(zip(df['item'], df['value']))
-        return info.get('股票简称', code)
-    except:
         pass
+    
+    return code2name, name2code
+
+def smart_search(query, code2name, name2code):
+    """
+    智能搜索：支持代码或名称
+    返回: (code, name, is_found)
+    """
+    query = str(query).strip()
+    
+    # 1. 如果是6位数字，优先当做代码查
+    if query.isdigit() and len(query) == 6:
+        if query in code2name:
+            return query, code2name[query], True
+        else:
+            # 本地列表没找到，可能是漏了，尝试强制联网查个股信息
+            try:
+                # 强制回退机制：直接查个股资料
+                df_info = ak.stock_individual_info_em(symbol=query)
+                info = dict(zip(df_info['item'], df_info['value']))
+                real_name = info.get('股票简称', query)
+                return query, real_name, True
+            except:
+                return query, "未识别股票", False
+
+    # 2. 否则当做中文名称查
+    if query in name2code:
+        return name2code[query], query, True
         
-    return code # 实在找不到，返回代码
+    # 3. 模糊搜索 (比如输入 "平安")
+    # 只有当 query 包含中文时才模糊搜
+    for name, code in name2code.items():
+        if query in name:
+            return code, name, True
+            
+    return query, "未知", False
 
 # ----------------------------------------------------------------------------- 
 # 3. 历史行情获取逻辑 (多源轮询)
@@ -139,44 +162,66 @@ def get_stock_history(code, days):
     return df, None, logs
 
 # ----------------------------------------------------------------------------- 
-# 4. 用户界面 (极简版)
+# 4. 用户界面
 # -----------------------------------------------------------------------------
-st.sidebar.title("数据获取助手")
+st.sidebar.title("Hunter Data Fetcher")
+st.sidebar.caption("支持代码或名称搜索 (如: 002860 或 星帅尔)")
 st.sidebar.markdown("---")
 
-# 1. 预加载全市场名称映射 (后台运行，静默加载)
-with st.spinner("正在初始化股票列表..."):
-    name_map = get_all_stock_names_map()
+# 1. 预加载全市场名称映射
+with st.spinner("正在加载市场列表..."):
+    code_map, name_map = get_market_maps()
 
 # 2. 输入区
-input_code = st.sidebar.text_input("股票代码", value="603777")
+query_input = st.sidebar.text_input("输入代码或名称", value="002860")
 lookback = st.sidebar.slider("查询回溯天数", 30, 1000, 365)
 
-# 实时显示名称预览
-current_name = get_stock_name_robust(input_code, name_map)
-if current_name != input_code:
-    st.sidebar.success(f"匹配股票: **{current_name}**")
+# 3. 智能识别与反馈
+target_code, target_name, is_found = smart_search(query_input, code_map, name_map)
+
+if is_found:
+    st.sidebar.success(f"已锁定: **{target_name} ({target_code})**")
 else:
-    st.sidebar.warning("未匹配到名称，请确认代码")
+    if query_input:
+        st.sidebar.warning(f"本地列表未找到 '{query_input}'，尝试强制查询...")
+        # 如果是6位数字，我们还是允许它作为代码去尝试
+        if query_input.isdigit() and len(query_input) == 6:
+            target_code = query_input
+            target_name = "未知股票" # 暂时标记，查询成功后会更新
+        else:
+            target_code = None
 
 st.sidebar.markdown("---")
-# 3. 查询按钮
+
+# 4. 查询按钮
 if st.sidebar.button("开始查询", type="primary"):
     
-    if current_name == input_code:
-        st.error(f"❌ 无法识别代码 {input_code} 的中文名称，请检查输入。")
+    if not target_code:
+        st.error("❌ 无效的输入，请输入 6 位股票代码或正确的中文简称。")
     else:
-        with st.spinner(f"正在获取 【{current_name}】 的历史数据..."):
-            df, err, logs = get_stock_history(input_code, lookback)
+        with st.spinner(f"正在获取 【{target_name}】 ({target_code}) 的数据..."):
+            df, err, logs = get_stock_history(target_code, lookback)
         
         if err:
-            st.error(err)
+            st.error(f"❌ 获取失败: {err}")
+            with st.expander("查看详细日志"):
+                st.write(logs)
         else:
+            # 如果之前没识别出名字（强制查询的情况），现在再尝试更新一次名字
+            if target_name in ["未识别股票", "未知股票", "未知"]:
+                # 尝试从 akshare 个股信息接口再次确认
+                try:
+                    info_df = ak.stock_individual_info_em(symbol=target_code)
+                    info_dict = dict(zip(info_df['item'], info_df['value']))
+                    target_name = info_dict.get('股票简称', target_name)
+                except:
+                    pass
+            
             # 注入名称到 DataFrame
-            df['name'] = current_name
+            df['name'] = target_name
             
             # 界面展示
-            st.success(f"获取成功: {current_name} ({input_code})")
+            st.success(f"获取成功: {target_name} ({target_code})")
             
             # 获取最新数据用于展示
             last_row = df.iloc[-1]
@@ -195,17 +240,19 @@ if st.sidebar.button("开始查询", type="primary"):
             
             # 顶部指标栏
             c1, c2, c3 = st.columns(3)
-            c1.metric("股票名称", current_name)
+            c1.metric("股票名称", target_name)
             c2.markdown(f"#### 收盘价: <span style='color:{color}'>{close_price}</span>", unsafe_allow_html=True)
             c3.markdown(f"#### 日期: {last_date}", unsafe_allow_html=True)
             
             st.markdown("---")
             
-            # --- 关键修改：文件下载 ---
+            # --- 下载功能 (文件名修复) ---
             # 格式: 【股票中文名称_时间】.csv
-            # 时间格式建议用 YYYYMMDD，避免冒号等非法字符
             file_time = datetime.datetime.now().strftime("%Y%m%d")
-            file_name = f"【{current_name}_{file_time}】.csv"
+            
+            # 再次确保文件名中没有非法字符
+            safe_name = target_name.replace("*", "").replace(":", "") 
+            file_name = f"【{safe_name}_{file_time}】.csv"
             
             csv_data = df.to_csv(index=False).encode('utf-8-sig')
             
@@ -228,5 +275,5 @@ if st.sidebar.button("开始查询", type="primary"):
                     if f'MA{ma}' in df:
                         fig.add_trace(go.Scatter(x=df['trade_date'], y=df[f'MA{ma}'], line=dict(width=1), name=f'MA{ma}'))
                 
-                fig.update_layout(height=450, xaxis_rangeslider_visible=False, title=f"{current_name} K线走势")
+                fig.update_layout(height=450, xaxis_rangeslider_visible=False, title=f"{target_name} ({target_code}) 走势图")
                 st.plotly_chart(fig, use_container_width=True)
