@@ -6,13 +6,13 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import datetime
 import pytz
-import io
+import time
 
 # ----------------------------------------------------------------------------- 
 # 0. Global Config
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Hunter V8.5",
+    page_title="Hunter V8.6",
     page_icon="🏹",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -55,20 +55,28 @@ def calc_chip_distribution(df, decimals=2):
         df['turnover_ratio'] = 1.0 
     else:
         df['turnover_ratio'] = df['turnover_ratio'].fillna(1.0)
+    
     for index, row in df.iterrows():
         price = round(row['close'], decimals)
         turnover = row['turnover_ratio'] / 100.0
+        
+        # 衰减旧筹码
         for p in list(chip_dict.keys()):
             chip_dict[p] = chip_dict[p] * (1.0 - turnover)
+        
+        # 增加新筹码
         if price in chip_dict:
             chip_dict[price] += turnover
         else:
             chip_dict[price] = turnover
+            
     chip_df = pd.DataFrame(list(chip_dict.items()), columns=['price', 'volume'])
     chip_df = chip_df.sort_values('price')
+    
     total_vol = chip_df['volume'].sum()
     if total_vol > 0:
         chip_df['volume'] = chip_df['volume'] / total_vol
+        
     chip_df['cumsum_vol'] = chip_df['volume'].cumsum()
     return chip_df
 
@@ -87,16 +95,47 @@ def get_chip_metrics(chip_df, current_price):
     return profit_ratio, avg_cost, concentration_90, chip_df
 
 # ----------------------------------------------------------------------------- 
-# 3. Data Fetching (Akshare)
+# 3. Data Fetching (Akshare) - Document Compliant
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=600)
 def get_full_data(code, days):
     data_bundle = {}
+    
+    # [Fix] 按照文档要求，计算 start_date 和 end_date
+    # 格式必须为 'YYYYMMDD' 字符串
+    end_dt = datetime.datetime.now()
+    start_dt = end_dt - datetime.timedelta(days=days)
+    
+    start_date_str = start_dt.strftime("%Y%m%d")
+    end_date_str = end_dt.strftime("%Y%m%d")
+
+    # 内部重试函数，解决偶尔的连接断开问题
+    def fetch_with_retry(func, retries=3, delay=1, **kwargs):
+        for i in range(retries):
+            try:
+                return func(**kwargs)
+            except Exception as e:
+                if i == retries - 1: raise e
+                time.sleep(delay)
+        return None
+
     # --- K Line --- 
     try:
-        df = ak.stock_zh_a_hist(symbol=code, period="daily", adjust="qfq")
+        # [Fix] 传入时间参数，减少数据请求量，防止被封
+        df = fetch_with_retry(
+            ak.stock_zh_a_hist,
+            retries=3,
+            delay=2,
+            symbol=code,
+            period="daily",
+            start_date=start_date_str,  # 新增参数
+            end_date=end_date_str,      # 新增参数
+            adjust="qfq"
+        )
+        
         if df is None or df.empty:
-            return None, "Akshare returned empty data."
+            return None, "Akshare returned empty data. Check if code is valid."
+            
         rename_map = {
             '日期': 'trade_date',
             '开盘': 'open',
@@ -110,19 +149,28 @@ def get_full_data(code, days):
         df = df.rename(columns=rename_map)
         df['trade_date'] = pd.to_datetime(df['trade_date'])
         df = df.sort_values('trade_date').reset_index(drop=True)
-        if len(df) > days:
-            df = df.iloc[-days:].reset_index(drop=True)
+        
+        # 确保数据格式为数字
         cols = ['open', 'high', 'low', 'close', 'volume', 'turnover_ratio', 'pct_change']
         for c in cols:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
+                
+        # 计算均线
         for ma in [5, 20, 60, 250]:
             df[f'MA{ma}'] = df['close'].rolling(window=ma).mean()
+            
+        # 计算MACD
         df['DIF'], df['DEA'], df['MACD'] = calculate_macd(df)
         data_bundle['history'] = df
+        
     except Exception as e:
-        return None, f"Error K-Line: {str(e)}"
-    # --- Chips --- 
+        err_msg = str(e)
+        if "RemoteDisconnected" in err_msg or "Connection aborted" in err_msg:
+            return None, "Connection blocked. Please try again or update akshare."
+        return None, f"Error K-Line: {err_msg}"
+
+    # --- Chips (筹码分布) --- 
     try:
         chip_raw_df = calc_chip_distribution(df)
         current_price = df.iloc[-1]['close']
@@ -134,15 +182,19 @@ def get_full_data(code, days):
         }
         data_bundle['chip_data'] = chip_final_df
     except Exception as e:
-        return None, f"Error Chips: {str(e)}"
-    # --- Financial --- 
+        # 允许K线成功但筹码失败（例如数据太少）
+        data_bundle['chip_metrics'] = {'profit_ratio':0, 'avg_cost':0, 'concentration_90':0}
+        data_bundle['chip_data'] = pd.DataFrame()
+
+    # --- Financial (个股信息) --- 
     try:
-        info_df = ak.stock_individual_info_em(symbol=code)
+        info_df = fetch_with_retry(ak.stock_individual_info_em, retries=3, symbol=code)
         info_dict = dict(zip(info_df['item'], info_df['value']))
         data_bundle['financial'] = info_dict
     except Exception as e:
         data_bundle['financial'] = {}
-    # --- Realtime --- 
+
+    # --- Realtime (实时价格) --- 
     try:
         last_row = df.iloc[-1]
         data_bundle['realtime'] = {
@@ -152,37 +204,40 @@ def get_full_data(code, days):
         }
     except Exception as e:
         data_bundle['realtime'] = {'error': str(e)}
+        
     return data_bundle, None
 
 # ----------------------------------------------------------------------------- 
 # 4. Main UI
 # -----------------------------------------------------------------------------
-st.sidebar.title("Hunter V8.5")
-st.sidebar.caption("Cloud Version")
+st.sidebar.title("Hunter V8.6")
+st.sidebar.caption("Document Compliant Ver")
 st.sidebar.markdown("---")
 input_code = st.sidebar.text_input("Code (6 digits)", value="603909")
-lookback_days = st.sidebar.slider("Days", 200, 1000, 500)
+lookback_days = st.sidebar.slider("Days Lookback", 200, 1000, 500)
 st.sidebar.markdown("### Risk Check")
 risk_check = st.sidebar.radio("Unlock Risk", ["Safe", "Risk"], index=0)
 risk_notes = st.sidebar.text_area("Notes", placeholder="Notes here...")
 
 if st.sidebar.button("Launch", type="primary"):
-    with st.spinner('Fetching Data...'):
+    with st.spinner(f'Fetching Data (Last {lookback_days} days)...'):
         data, err = get_full_data(input_code, lookback_days)
+    
     if err:
-        st.error(f"Error: {err}")
+        st.error(f"❌ {err}")
+        st.info("Tip: Try clicking 'Launch' again. If it fails repeatedly, check network or update akshare.")
     else:
         hist_df = data['history']
         rt_data = data['realtime']
         fin_data = data['financial']
         chip_metrics = data['chip_metrics']
         chip_dist_df = data['chip_data']
+        
         # Header
         name = rt_data.get('short_name', input_code)
         price = rt_data.get('price', '-')
         pct_change = rt_data.get('change_pct', 0)
         
-        # Determine color
         try:
             pct_val = float(pct_change)
             color_change = "red" if pct_val > 0 else ("green" if pct_val < 0 else "black")
@@ -200,12 +255,13 @@ if st.sidebar.button("Launch", type="primary"):
             st.metric("Industry", fin_data.get('行业', '-'))
             
         st.markdown("---")
+        
         # Dashboard
         m1, m2, m3, m4 = st.columns(4)
         with m1:
-            st.metric("Profit Ratio", f"{chip_metrics['profit_ratio']:.2f}%")
+            st.metric("Profit Ratio", f"{chip_metrics.get('profit_ratio', 0):.2f}%")
         with m2:
-            st.metric("Avg Cost", f"{chip_metrics['avg_cost']:.2f}")
+            st.metric("Avg Cost", f"{chip_metrics.get('avg_cost', 0):.2f}")
         with m3:
             pe = fin_data.get('市盈率(动)', fin_data.get('市盈率(TTM)', '-'))
             st.metric("PE Ratio", f"{pe}")
@@ -217,8 +273,7 @@ if st.sidebar.button("Launch", type="primary"):
             
         # Download
         export_df = hist_df.copy()
-        bj_time = get_beijing_time()
-        export_df['export_time'] = bj_time
+        export_df['export_time'] = get_beijing_time()
         export_df['risk_status'] = risk_check
         export_df['risk_notes'] = risk_notes
         csv = export_df.to_csv(index=False).encode('utf-8-sig')
@@ -234,7 +289,6 @@ if st.sidebar.button("Launch", type="primary"):
         with tab1:
             fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
             
-            # Candlestick
             fig_k.add_trace(go.Candlestick(
                 x=hist_df['trade_date'],
                 open=hist_df['open'], high=hist_df['high'],
@@ -242,7 +296,6 @@ if st.sidebar.button("Launch", type="primary"):
                 name='K'
             ), row=1, col=1)
             
-            # MA lines
             for ma, color in zip([5, 20, 60], ['orange', 'purple', 'blue']):
                 if f'MA{ma}' in hist_df.columns:
                     fig_k.add_trace(go.Scatter(
@@ -250,7 +303,6 @@ if st.sidebar.button("Launch", type="primary"):
                         mode='lines', name=f'MA{ma}', line=dict(color=color, width=1)
                     ), row=1, col=1)
                     
-            # Volume
             vol_colors = ['red' if r['close'] >= r['open'] else 'green' for i, r in hist_df.iterrows()]
             fig_k.add_trace(go.Bar(
                 x=hist_df['trade_date'], y=hist_df['volume'],
@@ -261,40 +313,28 @@ if st.sidebar.button("Launch", type="primary"):
             st.plotly_chart(fig_k, use_container_width=True)
             
         with tab2:
-            cur_p = float(price) if price != '-' else 0
-            # 补全被截断的逻辑
-            chip_prof = chip_dist_df[chip_dist_df['price'] <= cur_p]
-            chip_loss = chip_dist_df[chip_dist_df['price'] > cur_p]
-            
-            fig_chip = go.Figure()
-            # 获利盘 (Profit) - 红色
-            fig_chip.add_trace(go.Bar(
-                y=chip_prof['price'], 
-                x=chip_prof['volume'],
-                orientation='h', 
-                name='获利盘 (Profit)',
-                marker_color='red',
-                opacity=0.6
-            ))
-            # 套牢盘 (Loss) - 绿色
-            fig_chip.add_trace(go.Bar(
-                y=chip_loss['price'], 
-                x=chip_loss['volume'],
-                orientation='h', 
-                name='套牢盘 (Loss)', 
-                marker_color='green',
-                opacity=0.6
-            ))
-            
-            # 当前价格线
-            fig_chip.add_hline(y=cur_p, line_dash="dash", line_color="black", annotation_text=f"Current: {cur_p}")
-            
-            fig_chip.update_layout(
-                title=f"筹码分布 (Chip Distribution) - {name}",
-                xaxis_title="占比 (Volume Ratio)",
-                yaxis_title="价格 (Price)",
-                height=600,
-                bargap=0.0,
-                hovermode="y unified"
-            )
-            st.plotly_chart(fig_chip, use_container_width=True)
+            if not chip_dist_df.empty:
+                cur_p = float(price) if price != '-' else 0
+                chip_prof = chip_dist_df[chip_dist_df['price'] <= cur_p]
+                chip_loss = chip_dist_df[chip_dist_df['price'] > cur_p]
+                
+                fig_chip = go.Figure()
+                fig_chip.add_trace(go.Bar(
+                    y=chip_prof['price'], x=chip_prof['volume'],
+                    orientation='h', name='获利盘 (Profit)',
+                    marker_color='red', opacity=0.6
+                ))
+                fig_chip.add_trace(go.Bar(
+                    y=chip_loss['price'], x=chip_loss['volume'],
+                    orientation='h', name='套牢盘 (Loss)', 
+                    marker_color='green', opacity=0.6
+                ))
+                fig_chip.add_hline(y=cur_p, line_dash="dash", line_color="black", annotation_text=f"Current: {cur_p}")
+                fig_chip.update_layout(
+                    title=f"筹码分布 (Chip Distribution) - {name}",
+                    xaxis_title="占比", yaxis_title="价格",
+                    height=600, bargap=0.0, hovermode="y unified"
+                )
+                st.plotly_chart(fig_chip, use_container_width=True)
+            else:
+                st.warning("Not enough data to calculate chip distribution.")
