@@ -273,9 +273,7 @@ if st.sidebar.button("Launch", type="primary"):
                 low=hist_df['low'], close=hist_df['close']，
                 name='K'
             ), row=1, col=1)
-            
-            
-            for ma, color in zip([5, 20, 60], ['orange', 'purple', 'blue']):
+                        for ma, color in zip([5, 20, 60], ['orange', 'purple', 'blue']):
                 if f'MA{ma}' 在 hist_df.columns:
                     fig_k.add_trace(go.Scatter(
                         x=hist_df['trade_date'], y=hist_df[f'MA{ma}']，
@@ -297,4 +295,5 @@ if st.sidebar.button("Launch", type="primary"):
             # 原始代码在此处截断，已注释以防止报错
             # chip_loss = ch 
             pass
+
 
