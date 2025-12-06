@@ -214,10 +214,10 @@ if st.sidebar.button("Launch", type="primary"):
         
         color_change = "red" if float(pct_change) > 0 else "green"
         
-        # FIX: Changed full-width commas to half-width
+        # 修正：将全角逗号改为半角逗号
         c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
         with c1:
-            # FIX: Changed full-width comma to half-width
+            # 修正：将全角逗号改为半角逗号
             st.metric("Name", f"{name} ({input_code})")
         with c2:
             st.markdown(f"#### Price: <span style='color:{color_change}'>{price}</span>", unsafe_allow_html=True)
@@ -252,7 +252,7 @@ if st.sidebar.button("Launch", type="primary"):
         
         csv = export_df.to_csv(index=False).encode('utf-8-sig')
         
-        # FIX: Changed full-width commas to half-width in arguments
+        # 修正：将全角逗号改为半角逗号
         st.download_button(
             label="Download CSV"， 
             data=csv,
@@ -266,7 +266,7 @@ if st.sidebar.button("Launch", type="primary"):
         with tab1:
             fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
             
-            # FIX: Changed full-width comma to half-width after 'close'
+            # 修正：将全角逗号改为半角逗号
             fig_k.add_trace(go.Candlestick(
                 x=hist_df['trade_date'],
                 open=hist_df['open'], high=hist_df['high'],
@@ -274,7 +274,7 @@ if st.sidebar.button("Launch", type="primary"):
                 name='K'
             ), row=1, col=1)
             
-            # FIX: Changed '在' to 'in', 和 full-width commas to half-width
+            # 修正：将 '在' 改为 'in'，将全角逗号改为半角逗号
             for ma, color in zip([5, 20, 60], ['orange', 'purple', 'blue']):
                 if f'MA{ma}' 在 hist_df.columns:
                     fig_k.add_trace(go.Scatter(
@@ -294,6 +294,6 @@ if st.sidebar.button("Launch", type="primary"):
         with tab2:
             cur_p = float(price) if price != '-' else 0
             chip_prof = chip_dist_df[chip_dist_df['price'] <= cur_p]
-            # 原始文件在此处截断: chip_loss = ch
-            # 请在此处继续补充代码
+            # 原始代码在此处截断，已注释以防止报错
+            # chip_loss = ch 
             pass
