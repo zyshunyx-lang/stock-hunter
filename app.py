@@ -6,7 +6,7 @@ import akshare as ak
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import datetime
-import pytz  # 用于时区修正
+import pytz
 import io
 
 # -----------------------------------------------------------------------------
@@ -33,7 +33,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 def get_beijing_time():
-    """获取当前北京时间，用于修正云服务器的时区问题"""
+    """获取当前北京时间"""
     utc_now = datetime.datetime.now(pytz.utc)
     return utc_now.astimezone(pytz.timezone('Asia/Shanghai'))
 
@@ -48,63 +48,48 @@ def calculate_macd(df, short=12, long=26, mid=9):
     return dif, dea, macd
 
 # -----------------------------------------------------------------------------
-# 1. 核心算法：筹码分布 (Chip Distribution)
+# 1. 核心算法：筹码分布
 # -----------------------------------------------------------------------------
 def calc_chip_distribution(df, decimals=2):
-    """
-    计算筹码分布
-    逻辑：每日新筹码 = 换手率 * 收盘价；历史筹码 = 历史筹码 * (1-换手率)
-    """
-    chip_dict = {} # {price_bin: weight}
+    chip_dict = {} 
     
-    # 确保有换手率，没有则模拟
     if 'turnover_ratio' not in df.columns:
-        df['turnover_ratio'] = 1.0 # 默认 1%
+        df['turnover_ratio'] = 1.0 
     else:
         df['turnover_ratio'] = df['turnover_ratio'].fillna(1.0)
 
-    # 遍历历史数据计算筹码沉淀
     for index, row in df.iterrows():
         price = round(row['close'], decimals)
         turnover = row['turnover_ratio'] / 100 
         
-        # 1. 历史筹码衰减
         for p in list(chip_dict.keys()):
             chip_dict[p] = chip_dict[p] * (1 - turnover)
         
-        # 2. 新增当日筹码
         if price in chip_dict:
             chip_dict[price] += turnover
         else:
             chip_dict[price] = turnover
 
-    # 转换为 DataFrame 用于分析
     chip_df = pd.DataFrame(list(chip_dict.items()), columns=['price', 'volume'])
     chip_df = chip_df.sort_values('price')
     
-    # 归一化
     total_vol = chip_df['volume'].sum()
     if total_vol > 0:
         chip_df['volume'] = chip_df['volume'] / total_vol
     
-    # 计算累积分布用于计算集中度
     chip_df['cumsum_vol'] = chip_df['volume'].cumsum()
     
     return chip_df
 
 def get_chip_metrics(chip_df, current_price):
-    """计算筹码核心指标"""
     if chip_df.empty:
         return 0, 0, 0, 0
     
-    # 获利比例 (收盘价以下的筹码占比)
     profit_df = chip_df[chip_df['price'] <= current_price]
     profit_ratio = profit_df['volume'].sum() * 100
     
-    # 平均成本
     avg_cost = (chip_df['price'] * chip_df['volume']).sum()
     
-    # 筹码集中度计算 (90%筹码分布的价格区间)
     try:
         p05 = chip_df[chip_df['cumsum_vol'] >= 0.05].iloc[0]['price']
         p95 = chip_df[chip_df['cumsum_vol'] >= 0.95].iloc[0]['price']
@@ -115,21 +100,18 @@ def get_chip_metrics(chip_df, current_price):
     return profit_ratio, avg_cost, concentration_90, chip_df
 
 # -----------------------------------------------------------------------------
-# 2. 数据获取模块 (Data Fetching)
+# 2. 数据获取模块
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=600) # 缓存 10 分钟，减少云端请求压力
+@st.cache_data(ttl=600)
 def get_full_data(code, days):
-    """获取全息数据：K线、实时、财务、筹码"""
     data_bundle = {}
     
-    # ---------------- Step 1: 历史 K 线 (Adata) ----------------
+    # Step 1: K线
     try:
         df = adata.stock.market.get_market(stock_code=code, k_type=1)
-        
         if df is None or df.empty:
-            return None, "Adata 未返回 K 线数据，可能是代码错误或接口限流。"
+            return None, "Adata 未返回 K 线数据"
         
-        # 数据清洗
         if 'trade_date' in df.columns:
             df['trade_date'] = pd.to_datetime(df['trade_date'])
             df = df.sort_values('trade_date').reset_index(drop=True)
@@ -142,17 +124,15 @@ def get_full_data(code, days):
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         
-        # 计算技术指标
         for ma in [5, 20, 60, 250]:
             df[f'MA{ma}'] = df['close'].rolling(window=ma).mean()
         df['DIF'], df['DEA'], df['MACD'] = calculate_macd(df)
         
         data_bundle['history'] = df
-
     except Exception as e:
         return None, f"获取历史 K 线失败: {str(e)}"
 
-    # ---------------- Step 2: 筹码计算 ----------------
+    # Step 2: 筹码
     try:
         chip_raw_df = calc_chip_distribution(df)
         current_price = df.iloc[-1]['close']
@@ -167,7 +147,7 @@ def get_full_data(code, days):
     except Exception as e:
         return None, f"筹码计算失败: {str(e)}"
 
-    # ---------------- Step 3: 实时行情 ----------------
+    # Step 3: 实时
     try:
         real_df = adata.stock.market.list_market_current(stock_code=code)
         if real_df is not None and not real_df.empty:
@@ -182,7 +162,7 @@ def get_full_data(code, days):
     except Exception as e:
          data_bundle['realtime'] = {'error': str(e)}
 
-    # ---------------- Step 4: 深度财务 ----------------
+    # Step 4: 财务
     try:
         info_df = ak.stock_individual_info_em(symbol=code)
         info_dict = dict(zip(info_df['item'], info_df['value']))
@@ -193,10 +173,8 @@ def get_full_data(code, days):
     return data_bundle, None
 
 # -----------------------------------------------------------------------------
-# 3. 主界面逻辑
+# 3. 主界面
 # -----------------------------------------------------------------------------
-
-# 侧边栏
 st.sidebar.title("🏹 猎人指挥中心 V8.2")
 st.sidebar.caption("云端部署版 | 北京时间")
 st.sidebar.markdown("---")
@@ -205,24 +183,21 @@ lookback_days = st.sidebar.slider("K线回看天数", 200, 1000, 500)
 
 st.sidebar.markdown("### 🛡️ 风控确认")
 risk_check = st.sidebar.radio("未来30天解禁/减持风险", ["✅ 安全", "⚠️ 有风险/不确定"], index=0)
-risk_notes = st.sidebar.text_area("情报备注", placeholder="在此记录股东动态或利好利空...")
+risk_notes = st.sidebar.text_area("情报备注", placeholder="在此记录股东动态...")
 
-# 运行按钮
 if st.sidebar.button("🚀 启动分析引擎", type="primary"):
-    with st.spinner('正在链接云端数据源，计算筹码分布...'):
+    with st.spinner('正在链接数据源...'):
         data, err = get_full_data(input_code, lookback_days)
 
     if err:
         st.error(f"系统故障: {err}")
     else:
-        # 提取数据
         hist_df = data['history']
         rt_data = data['realtime']
         fin_data = data['financial']
         chip_metrics = data['chip_metrics']
         chip_dist_df = data['chip_data']
 
-        # ---------------- 标题栏 ----------------
         name = rt_data.get('short_name', fin_data.get('股票简称', input_code))
         price = rt_data.get('price', hist_df.iloc[-1]['close'])
         
@@ -230,7 +205,7 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             pct_change = float(rt_data.get('change_pct', 0))
         except:
             pct_change = 0
-            
+        
         color_change = "red" if pct_change > 0 else "green"
         
         c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
@@ -246,7 +221,6 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
 
         st.markdown("---")
 
-        # ---------------- 核心仪表盘 ----------------
         m1, m2, m3, m4 = st.columns(4)
         with m1:
             st.metric("💰 获利盘比例", f"{chip_metrics['profit_ratio']:.2f}%")
@@ -259,13 +233,10 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             pb = fin_data.get('每股净资产', '-')
             st.metric("每股净资产", pb)
 
-        # ---------------- 下载区域 (已修正时区) ----------------
+        # 下载区域
         export_df = hist_df.copy()
-        
-        # 使用北京时间函数
         bj_time = get_beijing_time()
         export_df['export_time'] = bj_time
-        
         export_df['risk_status'] = risk_check
         export_df['risk_notes'] = risk_notes
         export_df['chip_profit_ratio'] = chip_metrics['profit_ratio']
@@ -273,8 +244,9 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
         for k, v in fin_data.items():
             export_df.loc[0, f"fin_{k}"] = v
 
-        csv = export_df.to_csv(index=False).encode('utf-8-sig')
+        csv = export_df.to_csv(index=False)。encode('utf-8-sig')
         
+        # 修复点：这里确保使用了英文逗号
         st.download_button(
             label="📥 下载全息情报包 (.csv)"，
             data=csv,
@@ -282,11 +254,9 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             mime="text/csv"，
         )
 
-        # ---------------- 图表区域 ----------------
-        tab1, tab2 = st.tabs(["📊 K线技术分析"， "🧩 筹码分布模拟"])
+        tab1, tab2 = st.tabs(["📊 K线技术分析", "🧩 筹码分布模拟"])
 
         with tab1:
-            # K线图配置
             fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, 
                                   vertical_spacing=0.03, row_heights=[0.7, 0.3])
             
@@ -315,7 +285,6 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             st.plotly_chart(fig_k, use_container_width=True)
 
         with tab2:
-            # 筹码图配置
             current_p = float(price)
             chip_profit = chip_dist_df[chip_dist_df['price'] <= current_p]
             chip_loss = chip_dist_df[chip_dist_df['price'] > current_p]
