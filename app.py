@@ -274,7 +274,7 @@ if st.sidebar.button("Launch", type="primary"):
                 name='K'
             ), row=1, col=1)
             
-            # 修正：将 '在' 改为 'in'，将全角逗号改为半角逗号
+            
             for ma, color in zip([5, 20, 60], ['orange', 'purple', 'blue']):
                 if f'MA{ma}' 在 hist_df.columns:
                     fig_k.add_trace(go.Scatter(
@@ -297,3 +297,4 @@ if st.sidebar.button("Launch", type="primary"):
             # 原始代码在此处截断，已注释以防止报错
             # chip_loss = ch 
             pass
+
