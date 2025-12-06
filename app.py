@@ -306,7 +306,7 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
             fig_chip.update_layout(
                 title="筹码成本分布 (Chip Distribution)",
                 xaxis_title="筹码量 (相对比例)",
-                yaxis_title="价格"，
+                yaxis_title="价格",
                 height=600,
                 bargap=0.0, 
                 showlegend=True
@@ -322,6 +322,7 @@ if st.sidebar.button("🚀 启动分析引擎", type="primary"):
 
 else:
     st.info("👈 请在左侧输入股票代码并点击【启动分析引擎】")
+
 
 
 
