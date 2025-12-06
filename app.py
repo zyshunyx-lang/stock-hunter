@@ -181,7 +181,14 @@ if st.sidebar.button("Launch", type="primary"):
         name = rt_data.get('short_name', input_code)
         price = rt_data.get('price', '-')
         pct_change = rt_data.get('change_pct', 0)
-        color_change = "red" if float(pct_change) > 0 else "green"
+        
+        # Determine color
+        try:
+            pct_val = float(pct_change)
+            color_change = "red" if pct_val > 0 else ("green" if pct_val < 0 else "black")
+        except:
+            color_change = "black"
+
         c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
         with c1:
             st.metric("Name", f"{name} ({input_code})")
@@ -190,22 +197,24 @@ if st.sidebar.button("Launch", type="primary"):
         with c3:
             st.markdown(f"#### Change: <span style='color:{color_change}'>{pct_change}%</span>", unsafe_allow_html=True)
         with c4:
-            st.metric("Industry", fin_data.get('行业', '-'))  # 修正 
+            st.metric("Industry", fin_data.get('行业', '-'))
+            
         st.markdown("---")
         # Dashboard
         m1, m2, m3, m4 = st.columns(4)
         with m1:
             st.metric("Profit Ratio", f"{chip_metrics['profit_ratio']:.2f}%")
         with m2:
-            st.metric("Avg Cost", f"{chip_metrics['avg_cost']:.2f}")  # 修正
+            st.metric("Avg Cost", f"{chip_metrics['avg_cost']:.2f}")
         with m3:
             pe = fin_data.get('市盈率(动)', fin_data.get('市盈率(TTM)', '-'))
             st.metric("PE Ratio", f"{pe}")
         with m4:
             val = fin_data.get('总市值', '-')
             if isinstance(val, (int, float)):
-                val = f"{val/100000000:.2f}B"
+                val = f"{val/100000000:.2f}亿"
             st.metric("Market Cap", f"{val}")
+            
         # Download
         export_df = hist_df.copy()
         bj_time = get_beijing_time()
@@ -214,37 +223,78 @@ if st.sidebar.button("Launch", type="primary"):
         export_df['risk_notes'] = risk_notes
         csv = export_df.to_csv(index=False).encode('utf-8-sig')
         st.download_button(
-            label="Download CSV",  # 修正
+            label="Download CSV",
             data=csv,
-            file_name=f"Stock_{input_code}.csv",  # 修正
+            file_name=f"Stock_{input_code}.csv",
             mime="text/csv"
         )
+        
         # Tabs
-        tab1, tab2 = st.tabs(["K-Line", "Chips"])  # 修正
+        tab1, tab2 = st.tabs(["K-Line", "Chips"])
         with tab1:
             fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
+            
+            # Candlestick
             fig_k.add_trace(go.Candlestick(
                 x=hist_df['trade_date'],
                 open=hist_df['open'], high=hist_df['high'],
                 low=hist_df['low'], close=hist_df['close'],
                 name='K'
             ), row=1, col=1)
+            
+            # MA lines
             for ma, color in zip([5, 20, 60], ['orange', 'purple', 'blue']):
-                if f'MA{ma}' in hist_df.columns:  # 修正
+                if f'MA{ma}' in hist_df.columns:
                     fig_k.add_trace(go.Scatter(
                         x=hist_df['trade_date'], y=hist_df[f'MA{ma}'],
                         mode='lines', name=f'MA{ma}', line=dict(color=color, width=1)
                     ), row=1, col=1)
+                    
+            # Volume
             vol_colors = ['red' if r['close'] >= r['open'] else 'green' for i, r in hist_df.iterrows()]
             fig_k.add_trace(go.Bar(
                 x=hist_df['trade_date'], y=hist_df['volume'],
                 name='Vol', marker_color=vol_colors
             ), row=2, col=1)
+            
             fig_k.update_layout(xaxis_rangeslider_visible=False, height=600, margin=dict(l=0,r=0,t=10,b=0))
             st.plotly_chart(fig_k, use_container_width=True)
+            
         with tab2:
             cur_p = float(price) if price != '-' else 0
+            # 补全被截断的逻辑
             chip_prof = chip_dist_df[chip_dist_df['price'] <= cur_p]
-            # 原始代码在此处截断，已注释以防止报错
-            # chip_loss = ch 
-            pass
+            chip_loss = chip_dist_df[chip_dist_df['price'] > cur_p]
+            
+            fig_chip = go.Figure()
+            # 获利盘 (Profit) - 红色
+            fig_chip.add_trace(go.Bar(
+                y=chip_prof['price'], 
+                x=chip_prof['volume'],
+                orientation='h', 
+                name='获利盘 (Profit)',
+                marker_color='red',
+                opacity=0.6
+            ))
+            # 套牢盘 (Loss) - 绿色
+            fig_chip.add_trace(go.Bar(
+                y=chip_loss['price'], 
+                x=chip_loss['volume'],
+                orientation='h', 
+                name='套牢盘 (Loss)', 
+                marker_color='green',
+                opacity=0.6
+            ))
+            
+            # 当前价格线
+            fig_chip.add_hline(y=cur_p, line_dash="dash", line_color="black", annotation_text=f"Current: {cur_p}")
+            
+            fig_chip.update_layout(
+                title=f"筹码分布 (Chip Distribution) - {name}",
+                xaxis_title="占比 (Volume Ratio)",
+                yaxis_title="价格 (Price)",
+                height=600,
+                bargap=0.0,
+                hovermode="y unified"
+            )
+            st.plotly_chart(fig_chip, use_container_width=True)
