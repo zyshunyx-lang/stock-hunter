@@ -1,39 +1,24 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import akshare as ak
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import datetime
 import pytz
 import time
 import random
 
 # ----------------------------------------------------------------------------- 
-# 0. Global Config
+# 0. 全局配置
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Hunter V9.0 (Multi-Port)",
-    page_icon="🏹",
+    page_title="Hunter Data Fetcher",
+    page_icon="💾",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: #f0f2f6;
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
-    }
-    .status-ok { color: green; font-weight: bold; }
-    .status-fail { color: red; }
-</style>
-""", unsafe_allow_html=True)
-
 # ----------------------------------------------------------------------------- 
-# 1. Helper Functions
+# 1. 辅助函数
 # -----------------------------------------------------------------------------
 def get_beijing_time():
     utc_now = datetime.datetime.now(pytz.utc)
@@ -56,300 +41,217 @@ def calculate_macd(df, short=12, long=26, mid=9):
     return dif, dea, macd
 
 # ----------------------------------------------------------------------------- 
-# 2. Chip Distribution Algo
+# 2. 数据获取核心 (5端口轮询 - 仅保留数据获取)
 # -----------------------------------------------------------------------------
-def calc_chip_distribution(df, decimals=2):
-    chip_dict = {} 
-    
-    # 智能补全换手率：如果缺少换手率数据，默认使用 2.0% (0.02) 作为估算值
-    # 在 get_full_data 中我们会尝试用 (成交量/流通股本) 来计算精确值
-    if 'turnover_ratio' not in df.columns:
-        df['turnover_ratio'] = 2.0 
-    else:
-        df['turnover_ratio'] = df['turnover_ratio'].fillna(2.0)
-    
-    for index, row in df.iterrows():
-        price = round(row['close'], decimals)
-        turnover = row['turnover_ratio'] / 100.0
-        
-        # 历史筹码衰减
-        for p in list(chip_dict.keys()):
-            chip_dict[p] = chip_dict[p] * (1.0 - turnover)
-        
-        # 新增筹码
-        if price in chip_dict:
-            chip_dict[price] += turnover
-        else:
-            chip_dict[price] = turnover
-            
-    chip_df = pd.DataFrame(list(chip_dict.items()), columns=['price', 'volume'])
-    chip_df = chip_df.sort_values('price')
-    
-    total_vol = chip_df['volume'].sum()
-    if total_vol > 0:
-        chip_df['volume'] = chip_df['volume'] / total_vol
-        
-    chip_df['cumsum_vol'] = chip_df['volume'].cumsum()
-    return chip_df
-
-def get_chip_metrics(chip_df, current_price):
-    if chip_df.empty:
-        return 0, 0, 0, 0
-    profit_df = chip_df[chip_df['price'] <= current_price]
-    profit_ratio = profit_df['volume'].sum() * 100
-    avg_cost = (chip_df['price'] * chip_df['volume']).sum()
-    try:
-        p05 = chip_df[chip_df['cumsum_vol'] >= 0.05].iloc[0]['price']
-        p95 = chip_df[chip_df['cumsum_vol'] >= 0.95].iloc[0]['price']
-        concentration_90 = (p95 - p05) / (p05 + p95) * 2 * 100
-    except:
-        concentration_90 = 0
-    return profit_ratio, avg_cost, concentration_90, chip_df
-
-# ----------------------------------------------------------------------------- 
-# 3. Data Fetching Strategies (The 5 Ports)
-# -----------------------------------------------------------------------------
-
-# 通用清洗函数
 def clean_data(df, col_map):
+    """清洗数据并统一列名为 Gemini 友好的英文格式"""
     df = df.rename(columns=col_map)
-    df['trade_date'] = pd.to_datetime(df['trade_date'])
-    df = df.sort_values('trade_date').reset_index(drop=True)
+    if 'trade_date' in df.columns:
+        df['trade_date'] = pd.to_datetime(df['trade_date'])
+        df = df.sort_values('trade_date').reset_index(drop=True)
+    
     numeric_cols = ['open', 'high', 'low', 'close', 'volume']
     for c in numeric_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors='coerce')
     return df
 
-# 策略 1: 东方财富 (EastMoney) - 包含换手率，质量最好
-def strategy_em(code, start_date, end_date):
-    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="qfq")
-    if df is None or df.empty: raise ValueError("Empty Data")
+# 各个数据源策略
+def strategy_em(code, s, e):
+    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=s, end_date=e, adjust="qfq")
+    if df is None or df.empty: raise ValueError("Empty")
+    # 映射为英文列名
     return clean_data(df, {
-        '日期': 'trade_date', '开盘': 'open', '最高': 'high', '最低': 'low', 
-        '收盘': 'close', '成交量': 'volume', '换手率': 'turnover_ratio', '涨跌幅': 'pct_change'
+        '日期': 'trade_date', '开盘': 'open', '收盘': 'close', 
+        '最高': 'high', '最低': 'low', '成交量': 'volume', 
+        '换手率': 'turnover', '涨跌幅': 'pct_change'
     })
 
-# 策略 2: 新浪财经 (Sina) - 稳定，需前缀
-def strategy_sina(code, start_date, end_date):
-    symbol = get_symbol_prefix(code)
-    df = ak.stock_zh_a_daily(symbol=symbol, start_date=start_date, end_date=end_date, adjust="qfq")
-    if df is None or df.empty: raise ValueError("Empty Data")
-    # Sina返回: date, open, high, low, close, volume
+def strategy_sina(code, s, e):
+    sym = get_symbol_prefix(code)
+    df = ak.stock_zh_a_daily(symbol=sym, start_date=s, end_date=e, adjust="qfq")
+    if df is None or df.empty: raise ValueError("Empty")
     return clean_data(df, {'date': 'trade_date'})
 
-# 策略 3: 腾讯财经 (Tencent) - 需前缀
-def strategy_tencent(code, start_date, end_date):
-    symbol = get_symbol_prefix(code)
-    df = ak.stock_zh_a_hist_tx(symbol=symbol, start_date=start_date, end_date=end_date, adjust="qfq")
-    if df is None or df.empty: raise ValueError("Empty Data")
+def strategy_tencent(code, s, e):
+    sym = get_symbol_prefix(code)
+    df = ak.stock_zh_a_hist_tx(symbol=sym, start_date=s, end_date=e, adjust="qfq")
+    if df is None or df.empty: raise ValueError("Empty")
     return clean_data(df, {'date': 'trade_date'})
 
-# 策略 4: 网易财经 (NetEase/163) - 历史悠久
-def strategy_netease(code, start_date, end_date):
-    # 网易通常直接用6位代码，或者特定格式，akshare封装一般已处理
-    try:
-        df = ak.stock_zh_a_hist_163(symbol=code, start_date=start_date, end_date=end_date)
-    except:
-        # 尝试带前缀
-        symbol = get_symbol_prefix(code)
-        df = ak.stock_zh_a_hist_163(symbol=symbol, start_date=start_date, end_date=end_date)
-    if df is None or df.empty: raise ValueError("Empty Data")
-    return clean_data(df, {'日期': 'trade_date', '收盘价': 'close', '开盘价': 'open', '最高价': 'high', '最低价': 'low', '成交量': 'volume'})
-
-# 策略 5: 备用/实时转历史 (Fallback)
-def strategy_fallback(code, start_date, end_date):
-    # 如果以上都失败，尝试获取不复权的数据，可能接口不同
-    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start_date, end_date=end_date, adjust="")
-    if df is None or df.empty: raise ValueError("Empty Data")
-    return clean_data(df, {
-        '日期': 'trade_date', '开盘': 'open', '最高': 'high', '最低': 'low', 
-        '收盘': 'close', '成交量': 'volume', '换手率': 'turnover_ratio'
-    })
-
-# ----------------------------------------------------------------------------- 
-# 4. Main Data Fetcher (The Engine)
-# -----------------------------------------------------------------------------
+# 主获取函数
 @st.cache_data(ttl=600)
-def get_full_data(code, days):
+def get_stock_data(code, days):
     data_bundle = {}
     logs = []
     
-    # 日期计算
+    # 1. 获取基本面信息 (名称、行业、市值)
+    fin_info = {}
+    try:
+        df_info = ak.stock_individual_info_em(symbol=code)
+        fin_info = dict(zip(df_info['item'], df_info['value']))
+        logs.append("✅ 基本面数据获取成功")
+    except:
+        logs.append("⚠️ 基本面数据获取失败")
+    
+    data_bundle['financial'] = fin_info
+
+    # 2. 获取历史行情 (轮询)
     end_dt = datetime.datetime.now()
     start_dt = end_dt - datetime.timedelta(days=days)
     s_str = start_dt.strftime("%Y%m%d")
     e_str = end_dt.strftime("%Y%m%d")
-
-    # 定义策略列表
+    
     strategies = [
-        ("EastMoney (Official)", strategy_em),
-        ("Sina Finance", strategy_sina),
-        ("Tencent Stock", strategy_tencent),
-        ("NetEase (163)", strategy_netease),
-        ("EastMoney (Unadjusted)", strategy_fallback)
+        ("EastMoney", strategy_em),
+        ("Sina", strategy_sina),
+        ("Tencent", strategy_tencent),
+        ("Fallback", lambda c,s,e: clean_data(ak.stock_zh_a_hist(symbol=c, period="daily", start_date=s, end_date=e, adjust=""), 
+                                              {'日期':'trade_date', '开盘':'open', '收盘':'close', '最高':'high', '最低':'low', '成交量':'volume'}))
     ]
     
     df = None
-    used_source = "None"
+    source_used = "None"
     
-    # --- 1. 获取个股信息 (用于补充换手率) ---
-    circulating_share = None
-    try:
-        info_df = ak.stock_individual_info_em(symbol=code)
-        info_dict = dict(zip(info_df['item'], info_df['value']))
-        data_bundle['financial'] = info_dict
-        # 获取流通股本 (用于计算换手率)
-        if '流通股本' in info_dict:
-            circulating_share = float(info_dict['流通股本'])
-    except:
-        data_bundle['financial'] = {}
-        logs.append("⚠️ Financial info fetch failed.")
-
-    # --- 2. 轮询获取历史行情 (K-Line) ---
-    for source_name, strategy_func in strategies:
+    for name, func in strategies:
         try:
-            time.sleep(random.uniform(0.5, 1.5)) # 稍微停顿，防止过快
-            temp_df = strategy_func(code, s_str, e_str)
+            time.sleep(random.uniform(0.3, 0.8))
+            temp_df = func(code, s_str, e_str)
             if temp_df is not None and not temp_df.empty:
                 df = temp_df
-                used_source = source_name
-                logs.append(f"✅ Success using {source_name}")
+                source_used = name
+                logs.append(f"✅ 行情数据源: {name}")
                 break
-        except Exception as e:
-            logs.append(f"❌ {source_name} failed: {str(e)[:50]}...")
+        except:
             continue
             
     if df is None:
-        return None, "All 5 data sources failed. Please check the code or try again later.", logs
-
-    # --- 3. 数据补全与计算 ---
+        return None, "所有接口均无法获取数据，请检查代码或稍后重试。", logs
+    
+    # 3. 数据清洗与指标计算
     # 补全 MACD
     for ma in [5, 20, 60]:
         df[f'MA{ma}'] = df['close'].rolling(window=ma).mean()
     df['DIF'], df['DEA'], df['MACD'] = calculate_macd(df)
     
-    # 补全换手率 (如果接口没返回)
-    if 'turnover_ratio' not in df.columns:
-        if circulating_share and circulating_share > 0:
-            # 换手率 = 成交量 / 流通股本 * 100
-            df['turnover_ratio'] = (df['volume'] / circulating_share) * 100
-            logs.append("ℹ️ Calculated turnover_ratio using financial data.")
+    # 补全元数据列 (方便 Gemini 读取 CSV 时知道这是哪个股票)
+    df['symbol'] = code
+    df['name'] = fin_info.get('股票简称', code)
+    df['industry'] = fin_info.get('行业', '-')
+    
+    # 补全换手率 (如果缺失)
+    if 'turnover' not in df.columns:
+        mcap = fin_info.get('流通股本')
+        if mcap:
+            df['turnover'] = (df['volume'] / float(mcap)) * 100
         else:
-            df['turnover_ratio'] = 2.0 # 默认 2%
-            logs.append("⚠️ Missing turnover data, using default 2%.")
+            df['turnover'] = 0.0
             
     data_bundle['history'] = df
-    data_bundle['source'] = used_source
-
-    # --- 4. 计算筹码 ---
+    data_bundle['source'] = source_used
+    
+    # 4. 实时摘要
     try:
-        chip_raw_df = calc_chip_distribution(df)
-        current_price = df.iloc[-1]['close']
-        profit_ratio, avg_cost, concentration, chip_final_df = get_chip_metrics(chip_raw_df, current_price)
-        data_bundle['chip_metrics'] = {
-            'profit_ratio': profit_ratio, 'avg_cost': avg_cost, 'concentration_90': concentration
-        }
-        data_bundle['chip_data'] = chip_final_df
-    except Exception as e:
-        data_bundle['chip_metrics'] = {'profit_ratio':0, 'avg_cost':0, 'concentration_90':0}
-        data_bundle['chip_data'] = pd.DataFrame()
-        logs.append(f"⚠️ Chip calc error: {str(e)}")
-
-    # --- 5. 实时数据 ---
-    try:
-        last_row = df.iloc[-1]
-        # 尝试计算涨跌幅 (如果接口没返回)
-        pct = last_row.get('pct_change', 0)
+        last = df.iloc[-1]
+        pct = last.get('pct_change', 0)
+        # 如果接口没返回涨跌幅，手动计算
         if pct == 0 and len(df) > 1:
-            prev_close = df.iloc[-2]['close']
-            pct = ((last_row['close'] - prev_close) / prev_close) * 100
+            prev = df.iloc[-2]['close']
+            pct = (last['close'] - prev) / prev * 100
             
         data_bundle['realtime'] = {
-            'short_name': data_bundle['financial'].get('股票简称', code),
-            'price': last_row['close'],
-            'change_pct': round(pct, 2)
+            'price': last['close'],
+            'pct': pct,
+            'date': last['trade_date'].strftime("%Y-%m-%d")
         }
-    except Exception as e:
-        data_bundle['realtime'] = {'error': str(e)}
+    except:
+        data_bundle['realtime'] = {'price': 0, 'pct': 0, 'date': '-'}
         
     return data_bundle, None, logs
 
 # ----------------------------------------------------------------------------- 
-# 5. Main UI
+# 3. 用户界面 (UI)
 # -----------------------------------------------------------------------------
-st.sidebar.title("Hunter V9.0")
-st.sidebar.caption("Multi-Source Failover")
+st.sidebar.title("数据下载器 (Gemini版)")
+st.sidebar.caption("专门用于提取清洗后的数据")
 st.sidebar.markdown("---")
 
-input_code = st.sidebar.text_input("Stock Code", value="603777")
-lookback_days = st.sidebar.slider("Lookback Days", 30, 365, 120)
+# 输入区
+input_code = st.sidebar.text_input("股票代码", value="603777")
+lookback = st.sidebar.slider("回溯天数", 30, 730, 365)
 
-if st.sidebar.button("Launch Analysis", type="primary"):
-    with st.spinner('Trying 5 different data ports...'):
-        data, err, logs = get_full_data(input_code, lookback_days)
-    
-    # 显示日志
-    with st.expander("Connection Logs (Debug)"):
-        for log in logs:
-            if "Success" in log: st.markdown(f"<span style='color:green'>{log}</span>", unsafe_allow_html=True)
-            elif "failed" in log: st.markdown(f"<span style='color:red'>{log}</span>", unsafe_allow_html=True)
-            else: st.write(log)
+st.sidebar.markdown("### ✍️ 手动补充信息")
+st.sidebar.caption("以下信息将写入CSV供Gemini分析")
+manual_avg = st.sidebar.number_input("主力/平均成本 (元)", value=0.0, step=0.1)
+manual_note = st.sidebar.text_area("筹码/分析备注", placeholder="例如：底部筹码集中，上方套牢盘较少...")
 
+if st.sidebar.button("获取数据", type="primary"):
+    with st.spinner("正在从多源接口拉取数据..."):
+        data, err, logs = get_stock_data(input_code, lookback)
+        
     if err:
         st.error(err)
+        with st.expander("错误日志"):
+            st.write(logs)
     else:
-        hist_df = data['history']
-        rt_data = data['realtime']
-        fin_data = data['financial']
-        chip_metrics = data['chip_metrics']
-        chip_dist_df = data['chip_data']
-        source = data['source']
+        df = data['history']
+        rt = data['realtime']
         
-        st.success(f"Data fetched successfully via: **{source}**")
-        
-        # Header
-        name = rt_data.get('short_name', input_code)
-        price = rt_data.get('price', '-')
-        pct_change = rt_data.get('change_pct', 0)
-        
-        color = "red" if float(pct_change) > 0 else "green"
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Name", name)
-        c2.markdown(f"#### Price: <span style='color:{color}'>{price}</span>", unsafe_allow_html=True)
-        c3.markdown(f"#### Change: <span style='color:{color}'>{pct_change}%</span>", unsafe_allow_html=True)
-        c4.metric("Market Cap", f"{float(fin_data.get('总市值', 0))/100000000:.2f}亿" if fin_data.get('总市值') else "-")
+        # 将用户手动输入的信息合并到 DataFrame
+        # 这样 Gemini 读取 CSV 时，每一行都能看到这些关键上下文
+        if manual_avg > 0:
+            df['manual_avg_cost'] = manual_avg
+        if manual_note:
+            df['manual_note'] = manual_note
             
+        # 顶部指标
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("股票名称", f"{df.iloc[0]['name']} ({input_code})")
+        color = "red" if rt['pct'] > 0 else "green"
+        c2.markdown(f"#### 现价: <span style='color:{color}'>{rt['price']:.2f}</span>", unsafe_allow_html=True)
+        c3.markdown(f"#### 涨跌: <span style='color:{color}'>{rt['pct']:.2f}%</span>", unsafe_allow_html=True)
+        c4.metric("数据来源", data['source'])
+
         st.markdown("---")
         
-        # Dashboard
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Profit Ratio", f"{chip_metrics['profit_ratio']:.2f}%")
-        m2.metric("Avg Cost", f"{chip_metrics['avg_cost']:.2f}")
-        m3.metric("Concentration (90%)", f"{chip_metrics['concentration_90']:.2f}%")
-        m4.metric("Source", source)
+        # 下载区 (最重要)
+        st.markdown("### 📥 数据下载")
+        st.info("提示：下载后的 CSV 包含所有技术指标（MACD, MA）和你的手动备注，可以直接上传给 Gemini 进行分析。")
+        
+        # 生成 CSV
+        csv = df.to_csv(index=False).encode('utf-8-sig')
+        file_name = f"{input_code}_{rt['date']}_GeminiData.csv"
+        
+        col_dl1, col_dl2 = st.columns([1, 4])
+        with col_dl1:
+            st.download_button(
+                label="⬇️ 下载 CSV 文件",
+                data=csv,
+                file_name=file_name,
+                mime="text/csv",
+                type="primary"
+            )
+        
+        # 图表预览
+        st.markdown("### 📊 K线预览")
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df['trade_date'], open=df['open'], high=df['high'], 
+            low=df['low'], close=df['close'], name='K线'
+        ))
+        
+        # 绘制均线
+        for ma, color in zip([20, 60], ['purple', 'blue']):
+            if f'MA{ma}' in df.columns:
+                fig.add_trace(go.Scatter(x=df['trade_date'], y=df[f'MA{ma}'], line=dict(color=color, width=1), name=f'MA{ma}'))
+        
+        # 如果有手动输入的成本价，画一条线
+        if manual_avg > 0:
+            fig.add_hline(y=manual_avg, line_dash="dash", line_color="orange", annotation_text="你的成本标记")
             
-        # Tabs
-        tab1, tab2 = st.tabs(["K-Line Chart", "Chip Distribution"])
-        with tab1:
-            fig_k = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
-            fig_k.add_trace(go.Candlestick(x=hist_df['trade_date'], open=hist_df['open'], high=hist_df['high'], low=hist_df['low'], close=hist_df['close'], name='K'), row=1, col=1)
-            for ma in [5, 20, 60]:
-                if f'MA{ma}' in hist_df.columns:
-                    fig_k.add_trace(go.Scatter(x=hist_df['trade_date'], y=hist_df[f'MA{ma}'], mode='lines', name=f'MA{ma}'), row=1, col=1)
-            fig_k.add_trace(go.Bar(x=hist_df['trade_date'], y=hist_df['volume'], name='Vol'), row=2, col=1)
-            fig_k.update_layout(height=600, xaxis_rangeslider_visible=False)
-            st.plotly_chart(fig_k, use_container_width=True)
-            
-        with tab2:
-            if not chip_dist_df.empty:
-                cur_p = float(price) if price != '-' else 0
-                prof = chip_dist_df[chip_dist_df['price'] <= cur_p]
-                loss = chip_dist_df[chip_dist_df['price'] > cur_p]
-                fig_c = go.Figure()
-                fig_c.add_trace(go.Bar(y=prof['price'], x=prof['volume'], orientation='h', name='Profit', marker_color='red'))
-                fig_c.add_trace(go.Bar(y=loss['price'], x=loss['volume'], orientation='h', name='Loss', marker_color='green'))
-                fig_c.add_hline(y=cur_p, line_dash="dash", annotation_text=f"Current: {cur_p}")
-                fig_c.update_layout(height=600, bargap=0, title=f"Chip Distribution ({name})")
-                st.plotly_chart(fig_c, use_container_width=True)
+        fig.update_layout(height=500, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=20, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 数据预览
+        with st.expander("查看原始数据表"):
+            st.dataframe(df.sort_values('trade_date', ascending=False), use_container_width=True)
