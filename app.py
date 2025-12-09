@@ -11,8 +11,8 @@ import numpy as np
 # 0. 全局配置
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Hunter Data Fetcher (Pro)",
-    page_icon="📊",
+    page_title="Hunter Data Fetcher (Ultra-Stable)",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -21,7 +21,7 @@ st.set_page_config(
 # 1. 核心辅助函数 & 技术指标计算
 # -----------------------------------------------------------------------------
 def get_symbol_prefix(code):
-    """自动补充代码前缀 (用于备用接口)"""
+    """自动补充代码前缀"""
     if not code or not isinstance(code, str): return code
     if code.startswith('6'): return f"sh{code}"
     if code.startswith('0') or code.startswith('3'): return f"sz{code}"
@@ -29,9 +29,7 @@ def get_symbol_prefix(code):
     return code
 
 def add_technical_indicators(df):
-    """
-    为数据增加丰富的技术指标列
-    """
+    """为数据增加丰富的技术指标列"""
     try:
         # 1. MACD
         close = df['close']
@@ -53,7 +51,7 @@ def add_technical_indicators(df):
         df['D'] = df['K'].ewm(com=2, adjust=False).mean()
         df['J'] = 3 * df['K'] - 2 * df['D']
 
-        # 4. RSI (相对强弱指标 6, 12, 24)
+        # 4. RSI
         def calc_rsi(series, period):
             delta = series.diff()
             up = delta.clip(lower=0)
@@ -66,233 +64,206 @@ def add_technical_indicators(df):
         df['RSI_6'] = calc_rsi(close, 6)
         df['RSI_12'] = calc_rsi(close, 12)
 
-        # 5. Bollinger Bands (布林带)
+        # 5. BOLL
         df['BOLL_MID'] = df['close'].rolling(window=20).mean()
         df['BOLL_STD'] = df['close'].rolling(window=20).std()
         df['BOLL_UPPER'] = df['BOLL_MID'] + 2 * df['BOLL_STD']
         df['BOLL_LOWER'] = df['BOLL_MID'] - 2 * df['BOLL_STD']
         
-        # 6. VWAP (成交量加权平均价) - 近似计算(每日)
-        # 注意：这是单日VWAP，即成交额/成交量，如果源数据有成交额的话
+        # 6. VWAP (单日近似)
         if 'amount' in df.columns and 'volume' in df.columns:
-             # 避免除以0
              df['VWAP_Day'] = df.apply(lambda x: x['amount'] / x['volume'] if x['volume'] > 0 else x['close'], axis=1)
 
-    except Exception as e:
-        print(f"指标计算部分出错: {e}")
-        
+    except Exception:
+        pass
     return df
 
 def clean_data_robust(df):
-    """标准化列名，保留更多有用信息"""
-    # 建立映射表
+    """标准化列名"""
     col_map = {
         '日期': 'trade_date', 'date': 'trade_date',
-        '开盘': 'open', 'open': 'open',
-        '收盘': 'close', 'close': 'close',
-        '最高': 'high', 'high': 'high',
-        '最低': 'low', 'low': 'low',
-        '成交量': 'volume', 'volume': 'volume',
-        '成交额': 'amount', 'amount': 'amount',
-        '振幅': 'amplitude', 
-        '涨跌幅': 'pct_change', 
-        '涨跌额': 'change_amount', 
-        '换手率': 'turnover_rate'
+        '开盘': 'open', 'open': 'open', '收盘': 'close', 'close': 'close',
+        '最高': 'high', 'high': 'high', '最低': 'low', 'low': 'low',
+        '成交量': 'volume', 'volume': 'volume', '成交额': 'amount', 'amount': 'amount',
+        '振幅': 'amplitude', '涨跌幅': 'pct_change', '涨跌额': 'change_amount', '换手率': 'turnover_rate'
     }
     df = df.rename(columns=col_map)
-    
-    # 格式化日期
     if 'trade_date' in df.columns:
         df['trade_date'] = pd.to_datetime(df['trade_date'])
         df = df.sort_values('trade_date').reset_index(drop=True)
     
-    # 强制转数值
     num_cols = ['open', 'high', 'low', 'close', 'volume', 'amount', 'amplitude', 'pct_change', 'turnover_rate']
     for c in num_cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-            
+        if c in df.columns: df[c] = pd.to_numeric(df[c], errors='coerce')
     return df
 
 # ----------------------------------------------------------------------------- 
-# 2. 升级版搜索核心 (使用实时行情接口作为索引)
+# 2. 稳健的搜索逻辑 (防崩溃设计)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
-def get_market_maps_pro():
+def load_lightweight_market_map():
     """
-    [核心升级] 使用 ak.stock_zh_a_spot_em() 获取全市场实时行情列表。
-    优点：包含所有活跃股票，涵盖 002860、工业富联等，数据最全。
+    仅加载【代码-名称】对应表，不拉取行情数据。
+    数据量极小，不易超时。如果失败，返回空字典，不阻断程序运行。
     """
-    code2name = {}
-    name2code = {}
     try:
-        # 获取全市场实时行情 (速度稍慢，但一次加载终身受用)
-        df = ak.stock_zh_a_spot_em()
-        # 提取代码和名称列 (通常是 '代码' 和 '名称')
-        # 兼容不同版本返回的列名
-        code_col = '代码' if '代码' in df.columns else 'f12'
-        name_col = '名称' if '名称' in df.columns else 'f14'
-        
-        df[code_col] = df[code_col].astype(str).str.strip()
-        df[name_col] = df[name_col].astype(str).str.strip()
-        
-        code2name = dict(zip(df[code_col], df[name_col]))
-        name2code = dict(zip(df[name_col], df[code_col]))
-    except Exception as e:
-        st.error(f"初始化股票列表失败，请检查网络或akshare版本: {e}")
-    
-    return code2name, name2code
+        df = ak.stock_info_a_code_name() # 这是一个很轻的接口
+        df['code'] = df['code'].astype(str).str.strip()
+        df['name'] = df['name'].astype(str).str.strip()
+        return dict(zip(df['code'], df['name'])), dict(zip(df['name'], df['code'])), True
+    except:
+        return {}, {}, False
 
-def smart_search_pro(query, code2name, name2code):
+def resolve_stock(query, code2name, name2code, is_map_online):
     """
-    超级搜索：精准匹配 -> 模糊匹配
+    解析用户输入：优先查表，查不到则强制联网反查
     """
     query = str(query).strip()
     
-    # 1. 代码精准匹配
-    if query in code2name:
-        return query, code2name[query], True
+    # 1. 尝试从本地字典查
+    if is_map_online:
+        # 代码匹配
+        if query in code2name:
+            return query, code2name[query], "本地索引"
+        # 名称匹配
+        if query in name2code:
+            return name2code[query], query, "本地索引"
+        # 模糊匹配
+        for name, code in name2code.items():
+            if query in name:
+                return code, name, "模糊匹配"
     
-    # 2. 名称精准匹配
-    if query in name2code:
-        return name2code[query], query, True
-        
-    # 3. 名称模糊匹配 (只要包含输入字符就算)
-    # 优先匹配以此开头的
-    for name, code in name2code.items():
-        if query == name: # 双重保险
-            return code, name, True
-        if query in name:
-            return code, name, True
-            
-    return None, None, False
+    # 2. 本地没找到 (或索引离线)，且输入像代码 (6位数字)
+    #    --> 启动【点对点强制查询】
+    if query.isdigit() and len(query) == 6:
+        try:
+            # 这是一个极轻量的单点查询，几乎不会失败
+            df = ak.stock_individual_info_em(symbol=query)
+            info = dict(zip(df['item'], df['value']))
+            real_name = info.get('股票简称', '未知名称')
+            return query, real_name, "强制穿透"
+        except:
+            return query, "未识别股票", "失败"
+
+    return None, None, "未找到"
 
 # ----------------------------------------------------------------------------- 
 # 3. 数据获取引擎
 # -----------------------------------------------------------------------------
-def strategy_em(code, s, e):
-    # 东财历史接口，包含最丰富的数据 (振幅、换手、成交额)
-    df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=s, end_date=e, adjust="qfq")
-    if df is None or df.empty: raise ValueError("Empty")
-    return clean_data_robust(df)
-
-def strategy_sina(code, s, e):
-    sym = get_symbol_prefix(code)
-    df = ak.stock_zh_a_daily(symbol=sym, start_date=s, end_date=e, adjust="qfq")
-    if df is None or df.empty: raise ValueError("Empty")
-    # 新浪数据较少，尽量标准化
-    return clean_data_robust(df)
-
-@st.cache_data(ttl=300)
-def get_stock_data_pro(code, name, days):
-    logs = []
-    
+def get_stock_history_robust(code, days):
     end_dt = datetime.datetime.now()
     start_dt = end_dt - datetime.timedelta(days=days)
     s_str, e_str = start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d")
     
-    # 优先使用东财，因为字段最全
-    strategies = [("EastMoney (全字段)", strategy_em), ("Sina (备用)", strategy_sina)]
-    
+    logs = []
     df = None
-    for src_name, func in strategies:
-        try:
-            time.sleep(random.uniform(0.1, 0.4))
-            temp_df = func(code, s_str, e_str)
-            if temp_df is not None and not temp_df.empty:
-                df = temp_df
-                logs.append(f"✅ 数据来源: {src_name}")
-                break
-        except: continue
-        
+    
+    # 策略1：东财历史 (最全)
+    try:
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=s_str, end_date=e_str, adjust="qfq")
+        if df is not None and not df.empty:
+            df = clean_data_robust(df)
+            logs.append("✅ 成功源: 东方财富")
+    except Exception as e:
+        logs.append(f"❌ 东财失败: {str(e)[:50]}")
+    
+    # 策略2：新浪 (备用)
     if df is None:
-        return None, "无法获取数据，请检查网络连接。", logs
-    
-    # --- 核心：增加数据丰富度 ---
-    # 1. 注入基本信息
-    df['code'] = code
-    df['name'] = name
-    
-    # 2. 计算高级指标
+        try:
+            time.sleep(0.5)
+            sym = get_symbol_prefix(code)
+            df = ak.stock_zh_a_daily(symbol=sym, start_date=s_str, end_date=e_str, adjust="qfq")
+            if df is not None and not df.empty:
+                df = clean_data_robust(df)
+                logs.append("✅ 成功源: 新浪财经")
+        except Exception as e:
+            logs.append(f"❌ 新浪失败: {str(e)[:50]}")
+
+    if df is None:
+        return None, "所有接口均无响应，可能是IP被暂时限制，请过几分钟再试。", logs
+
+    # 计算指标
     df = add_technical_indicators(df)
-    
     return df, None, logs
 
 # ----------------------------------------------------------------------------- 
-# 4. 用户界面 (UI)
+# 4. 用户界面
 # -----------------------------------------------------------------------------
-st.sidebar.title("全能股票数据提取")
-st.sidebar.caption("🔎 支持 002860 / 工业富联 / 601138 等搜索")
+st.sidebar.title("Hunter Data Fetcher")
+st.sidebar.caption("稳定版 | 防崩溃 | 强制查询")
 st.sidebar.markdown("---")
 
-# 初始化
-with st.spinner("正在连接交易所获取最新股票名录..."):
-    code_map, name_map = get_market_maps_pro()
+# 1. 尝试加载索引 (静默模式)
+code_map, name_map, map_status = load_lightweight_market_map()
 
-# 输入区
-query = st.sidebar.text_input("请输入股票代码或名称", value="002860")
-days = st.sidebar.slider("数据回溯天数", 30, 2000, 365)
+# 状态指示灯
+if map_status:
+    st.sidebar.success(f"🟢 中文名称库已连接 ({len(code_map)}只)")
+else:
+    st.sidebar.warning("🔴 中文名称库离线 (启用纯代码模式)")
 
-# 实时搜索反馈
-target_code, target_name, found = smart_search_pro(query, code_map, name_map)
+# 2. 输入区
+query = st.sidebar.text_input("股票代码/名称", value="002860", help="如本地库离线，请输入6位代码")
+days = st.sidebar.slider("回溯天数", 30, 2000, 365)
 
-if found:
-    st.sidebar.success(f"✅ 匹配成功: **{target_name}** ({target_code})")
+# 3. 解析目标
+target_code, target_name, method = resolve_stock(query, code_map, name_map, map_status)
+
+# 4. 搜索反馈
+if target_code:
+    if method == "失败":
+        st.sidebar.error(f"无法识别代码 {target_code}")
+        ready = False
+    else:
+        st.sidebar.info(f"锁定: **{target_name}** ({target_code})")
+        st.sidebar.caption(f"来源: {method}")
+        ready = True
 else:
     if query:
-        st.sidebar.error("❌ 未找到该股票，请检查输入")
+        st.sidebar.error("❌ 未找到，请尝试输入6位数字代码")
+    ready = False
 
 st.sidebar.markdown("---")
 
-if st.sidebar.button("🚀 获取并生成数据", type="primary", disabled=not found):
-    with st.spinner(f"正在深度挖掘 【{target_name}】 的历史与技术数据..."):
-        df, err, logs = get_stock_data_pro(target_code, target_name, days)
-        
+if st.sidebar.button("🚀 获取数据", type="primary", disabled=not ready):
+    # 即使 method='强制穿透'，我们也拿到了 code，可以获取数据
+    with st.spinner(f"正在穿透获取 【{target_name}】 数据..."):
+        df, err, logs = get_stock_history_robust(target_code, days)
+    
     if err:
         st.error(err)
+        with st.expander("调试日志"):
+            st.write(logs)
     else:
-        # 成功展示
-        st.success(f"数据获取完毕! 共 {len(df)} 条交易记录。")
+        # 补全信息
+        df['code'] = target_code
+        df['name'] = target_name
         
-        # 顶部概览
+        st.success(f"获取成功! 共 {len(df)} 行数据")
+        
+        # 概览
         last = df.iloc[-1]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("股票名称", target_name)
-        c2.metric("最新收盘", f"{last['close']}")
-        
-        # 处理可能缺失的涨跌幅
-        pct = last.get('pct_change', 0)
-        c3.metric("涨跌幅", f"{pct:.2f}%")
-        
-        # 处理可能缺失的换手率
-        to_rate = last.get('turnover_rate', 0)
-        c4.metric("换手率", f"{to_rate:.2f}%")
+        c1.metric("名称", target_name)
+        c2.metric("收盘", f"{last['close']:.2f}")
+        c3.metric("MACD", f"{last.get('MACD', 0):.3f}")
+        c4.metric("RSI(6)", f"{last.get('RSI_6', 0):.2f}")
         
         st.markdown("---")
         
-        # 1. 下载区域 (文件名修复)
-        safe_name = target_name.replace("*", "").replace(":", "").replace("?", "")
+        # 下载
+        safe_name = str(target_name).replace("*", "").replace(":", "")
         file_time = datetime.datetime.now().strftime("%Y%m%d")
         file_name = f"【{safe_name}_{file_time}】.csv"
-        
         csv_data = df.to_csv(index=False).encode('utf-8-sig')
         
         st.download_button(
-            label=f"📥 点击下载 CSV (包含 {len(df.columns)} 列数据)",
+            label=f"📥 下载 CSV 文件 ({file_name})",
             data=csv_data,
             file_name=file_name,
             mime="text/csv",
             type="primary"
         )
-        st.caption("提示: 下载的文件已包含 MACD, KDJ, RSI, BOLL, 均线, 换手率, 振幅, VWAP 等丰富字段。")
         
-        # 2. 数据直接预览 (替代图表)
-        st.markdown("### 📋 CSV 数据内容预览")
-        st.dataframe(
-            df.sort_values('trade_date', ascending=False), 
-            use_container_width=True,
-            height=500
-        )
-        
-        with st.expander("查看获取日志"):
-            st.write(logs)
+        st.markdown("### 📋 数据表内容")
+        st.dataframe(df.sort_values('trade_date', ascending=False), use_container_width=True, height=600)
