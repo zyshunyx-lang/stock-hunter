@@ -2,35 +2,108 @@ import streamlit as st
 import pandas as pd
 import akshare as ak
 import datetime
-import pytz
 import time
 import random
-import numpy as np
+import requests
+import re
 
 # ----------------------------------------------------------------------------- 
 # 0. 全局配置
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Hunter Data Fetcher (Final)",
-    page_icon="🔥",
+    page_title="Hunter Data Fetcher (Fast)",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # ----------------------------------------------------------------------------- 
-# 1. 核心工具函数
+# 1. 多源搜索核心 (新浪/腾讯/东财) - 替代本地大表
 # -----------------------------------------------------------------------------
-def get_symbol_prefix(code):
-    """自动补充代码前缀"""
-    if not code or not isinstance(code, str): return code
-    code = str(code).strip()
-    if code.startswith('6'): return f"sh{code}"
-    if code.startswith('0') or code.startswith('3'): return f"sz{code}"
-    if code.startswith('8') or code.startswith('4'): return f"bj{code}"
-    return code
+def search_sina(key):
+    """
+    新浪搜索接口：同时支持代码和中文名称
+    返回: (code, name, market_prefix) 或 None
+    """
+    try:
+        # 新浪建议接口
+        url = f"http://suggest3.sinajs.cn/suggest/type=&key={key}&name=suggestdata_{int(time.time())}"
+        headers = {'Referer': 'http://finance.sina.com.cn/'} 
+        r = requests.get(url, headers=headers, timeout=2)
+        content = r.text
+        
+        # 解析返回: var suggestdata_...="隆基绿能,11,601012,sh601012,...";
+        match = re.search(r'"(.*?)"', content)
+        if match:
+            data_str = match.group(1)
+            if not data_str: return None
+            
+            # 结果可能有多个，用分号隔开，我们取第一个A股结果
+            items = data_str.split(';')
+            for item in items:
+                parts = item.split(',')
+                if len(parts) > 4:
+                    # parts[3] 是带前缀的代码 (如 sh601012)
+                    # parts[4] 是中文名
+                    full_code = parts[3]
+                    name = parts[4]
+                    
+                    # 简单过滤: 只看 A 股 (sh6/sz0/sz3/bj4/bj8)
+                    if full_code.startswith(('sh6', 'sz0', 'sz3', 'bj4', 'bj8')):
+                        clean_code = full_code[2:] # 去掉 sh/sz/bj
+                        return clean_code, name, full_code[:2]
+    except:
+        pass
+    return None
 
+def search_tencent(key):
+    """
+    腾讯搜索接口 (作为新浪的备用)
+    """
+    try:
+        # 腾讯智能搜索接口
+        url = f"http://smartbox.gtimg.cn/s3/?v=2&q={key}&t=all"
+        r = requests.get(url, timeout=2)
+        content = r.text 
+        # 返回格式: v_hint="sz002860~星帅尔~002860~XS~A股~...^..."
+        
+        if 'v_hint="' in content:
+            raw = content.split('v_hint="')[1].split('"')[0]
+            if not raw or raw == "N": return None
+            
+            # 取第一条结果
+            first_result = raw.split('^')[0]
+            parts = first_result.split('~')
+            if len(parts) >= 3:
+                # parts[0] = sz002860 (full code)
+                # parts[1] = 星帅尔 (name)
+                # parts[2] = 002860 (code)
+                full_code = parts[0]
+                name = parts[1]
+                code = parts[2]
+                return code, name, full_code[:2]
+    except:
+        pass
+    return None
+
+def get_stock_info_fast(query):
+    """
+    统一搜索入口：先查新浪，再查腾讯
+    """
+    # 1. 尝试新浪
+    res = search_sina(query)
+    if res: return res[0], res[1], "新浪接口"
+    
+    # 2. 尝试腾讯
+    res = search_tencent(query)
+    if res: return res[0], res[1], "腾讯接口"
+    
+    return None, None, None
+
+# ----------------------------------------------------------------------------- 
+# 2. 数据处理与指标
+# -----------------------------------------------------------------------------
 def add_technical_indicators(df):
-    """添加技术指标 (MACD, KDJ, RSI, BOLL, MA, VWAP)"""
     try:
         close = df['close']
         # MACD
@@ -41,19 +114,6 @@ def add_technical_indicators(df):
         df['MACD'] = (df['DIF'] - df['DEA']) * 2
         # MA
         for w in [5, 10, 20, 60]: df[f'MA{w}'] = close.rolling(window=w).mean()
-        # RSI
-        delta = close.diff()
-        up = delta.clip(lower=0)
-        down = -1 * delta.clip(upper=0)
-        for p in [6, 12, 24]:
-            ma_up = up.ewm(com=p-1, adjust=False).mean()
-            ma_down = down.ewm(com=p-1, adjust=False).mean()
-            df[f'RSI_{p}'] = ma_up / (ma_up + ma_down) * 100
-        # BOLL
-        mid = close.rolling(20).mean()
-        std = close.rolling(20).std()
-        df['BOLL_UP'] = mid + 2*std
-        df['BOLL_LO'] = mid - 2*std
         # KDJ
         low_min = df['low'].rolling(9).min()
         high_max = df['high'].rolling(9).max()
@@ -61,14 +121,10 @@ def add_technical_indicators(df):
         df['K'] = rsv.ewm(com=2, adjust=False).mean()
         df['D'] = df['K'].ewm(com=2, adjust=False).mean()
         df['J'] = 3 * df['K'] - 2 * df['D']
-        # VWAP (日内近似)
-        if 'amount' in df.columns:
-            df['VWAP'] = df.apply(lambda x: x['amount']/x['volume'] if x['volume']>0 else x['close'], axis=1)
     except: pass
     return df
 
 def clean_data(df):
-    """清洗列名"""
     col_map = {
         '日期':'trade_date', 'date':'trade_date', '开盘':'open', 'open':'open',
         '收盘':'close', 'close':'close', '最高':'high', 'high':'high', '最低':'low', 'low':'low',
@@ -82,39 +138,10 @@ def clean_data(df):
     return df
 
 # ----------------------------------------------------------------------------- 
-# 2. 稳健的名称获取 (三级火箭策略)
-# -----------------------------------------------------------------------------
-def get_stock_name_robust(code, user_manual_name=None):
-    """
-    1. 如果用户填了名字，直接用用户的。
-    2. 如果没填，尝试联网查。
-    3. 如果联网失败，直接返回代码，不报错。
-    """
-    code = str(code).strip()
-    
-    # 策略 1: 用户手动覆盖 (最高优先级)
-    if user_manual_name and user_manual_name.strip():
-        return user_manual_name.strip(), "手动输入"
-        
-    # 策略 2: 尝试联网单点查询 (akshare个股资料)
-    try:
-        # 这个接口通常比全市场列表要快且稳定
-        df = ak.stock_individual_info_em(symbol=code)
-        info = dict(zip(df['item'], df['value']))
-        name = info.get('股票简称', None)
-        if name:
-            return name, "自动识别"
-    except:
-        pass
-        
-    # 策略 3: 彻底失败，返回代码作为名字 (保底)
-    return f"Stock_{code}", "未知(已强制执行)"
-
-# ----------------------------------------------------------------------------- 
-# 3. 数据获取引擎 (含重试)
+# 3. 数据获取引擎 (多源)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
-def fetch_data_engine(code, days):
+def fetch_stock_history(code, days):
     end_dt = datetime.datetime.now()
     start_dt = end_dt - datetime.timedelta(days=days)
     s_str, e_str = start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d")
@@ -122,122 +149,117 @@ def fetch_data_engine(code, days):
     logs = []
     df = None
     
-    # 尝试东财 (数据最全)
+    # 1. 东财 (最全)
     try:
         df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=s_str, end_date=e_str, adjust="qfq")
         if df is not None and not df.empty:
             df = clean_data(df)
-            logs.append("✅ 来源: 东方财富")
+            logs.append("✅ 行情来源: 东方财富")
     except Exception as e:
-        logs.append(f"❌ 东财接口异常: {e}")
+        logs.append(f"⚠️ 东财接口无响应: {e}")
         
-    # 尝试新浪 (备用)
+    # 2. 新浪 (备用)
     if df is None:
         try:
-            time.sleep(0.5)
-            sym = get_symbol_prefix(code)
-            df = ak.stock_zh_a_daily(symbol=sym, start_date=s_str, end_date=e_str, adjust="qfq")
+            # 需要前缀
+            if code.startswith('6'): prefix = "sh"
+            elif code.startswith('8') or code.startswith('4'): prefix = "bj"
+            else: prefix = "sz"
+            
+            df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", start_date=s_str, end_date=e_str, adjust="qfq")
             if df is not None and not df.empty:
                 df = clean_data(df)
-                logs.append("✅ 来源: 新浪财经")
+                logs.append("✅ 行情来源: 新浪财经")
         except Exception as e:
-            logs.append(f"❌ 新浪接口异常: {e}")
+            logs.append(f"⚠️ 新浪接口无响应: {e}")
 
     if df is None:
-        return None, "所有接口均无数据，请检查代码是否正确或退市。", logs
+        return None, "所有数据源均无法连接，请稍后重试。", logs
         
-    # 计算指标
     df = add_technical_indicators(df)
     return df, None, logs
 
 # ----------------------------------------------------------------------------- 
-# 4. 用户界面 (手动兜底版)
+# 4. 用户界面
 # -----------------------------------------------------------------------------
-st.sidebar.title("Hunter Pro (终极容错版)")
-st.sidebar.caption("解决“无法识别”问题的最终方案")
+st.sidebar.title("Hunter Pro (极速版)")
+st.sidebar.caption("🔎 基于新浪/腾讯实时接口")
 st.sidebar.markdown("---")
 
 # --- 输入区 ---
-st.sidebar.markdown("### 1. 股票设定")
-col1, col2 = st.sidebar.columns([1, 1.5])
-input_code = col1.text_input("代码", value="002860")
-# 关键修改：允许用户直接输入名字，绕过API
-input_name = col2.text_input("名称 (可选)", value="", placeholder="若识别失败请填此")
+col_in1, col_in2 = st.sidebar.columns([2, 1])
+query = col_in1.text_input("股票代码或名称", value="002860", placeholder="输入代码/中文名")
+days = col_in2.number_input("天数", 30, 2000, 365)
 
-days = st.sidebar.slider("回溯天数", 30, 2000, 365)
+# --- 实时搜索逻辑 ---
+# 每次输入变化，直接调用轻量级接口查询，不需要本地大表
+target_code = None
+target_name = None
 
-# --- 自动识别尝试 ---
-# 当代码输入完，界面刷新时，尝试自动给个提示，但不阻塞
-auto_name = "..."
-if len(input_code) == 6:
-    if not input_name:
-        st.sidebar.caption(f"正在尝试后台识别 {input_code} ...")
-else:
-    st.sidebar.warning("请输入 6 位股票代码")
+if query:
+    with st.spinner("🔍 正在全网搜索..."):
+        s_code, s_name, s_source = get_stock_info_fast(query)
+    
+    if s_code:
+        st.sidebar.success(f"已锁定: **{s_name}** ({s_code})")
+        st.sidebar.caption(f"识别来源: {s_source}")
+        target_code = s_code
+        target_name = s_name
+    else:
+        st.sidebar.error("❌ 未找到股票，请检查输入")
+        # 允许强制手动模式
+        st.sidebar.markdown("---")
+        st.sidebar.warning("如果确定代码正确，可在下方强制执行")
+        manual_code = st.sidebar.text_input("强制代码", value=query if query.isdigit() else "")
+        manual_name = st.sidebar.text_input("强制名称", value="自选股")
+        if manual_code and len(manual_code) == 6:
+            target_code = manual_code
+            target_name = manual_name
 
 st.sidebar.markdown("---")
 
-# --- 执行按钮 ---
-if st.sidebar.button("🚀 强制获取数据", type="primary"):
-    if len(input_code) != 6:
-        st.error("代码格式错误，必须是6位数字！")
-    else:
-        # 1. 确定名字 (绝不报错)
-        final_name, name_source = get_stock_name_robust(input_code, input_name)
+# --- 执行 ---
+if st.sidebar.button("🚀 获取数据", type="primary", disabled=not target_code):
+    with st.spinner(f"正在拉取 【{target_name}】 数据..."):
+        df, err, logs = fetch_stock_history(target_code, days)
         
-        # 2. 获取数据
-        with st.spinner(f"正在为 【{final_name}】 ({input_code}) 拉取数据..."):
-            df, err, logs = fetch_data_engine(input_code, days)
-            
-        if err:
-            st.error(err)
-            with st.expander("错误日志"):
-                st.write(logs)
-        else:
-            # 3. 成功展示
-            st.success(f"获取成功！股票: {final_name} | 来源: {name_source}")
-            
-            # 补全信息
-            df['code'] = input_code
-            df['name'] = final_name
-            
-            # 顶部数据展示
-            last = df.iloc[-1]
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("名称", final_name)
-            c2.metric("最新价", f"{last['close']:.2f}")
-            pct = last.get('pct_chg', 0)
-            color = "red" if pct > 0 else "green"
-            c3.markdown(f"#### 涨跌: <span style='color:{color}'>{pct:.2f}%</span>", unsafe_allow_html=True)
-            c4.metric("记录数", len(df))
-            
-            st.markdown("---")
-            
-            # 4. 下载 (文件名修复)
-            # 过滤非法字符，确保文件名合法
-            safe_name = str(final_name).replace("*", "").replace(":", "").replace("?", "").replace("/", "")
-            file_time = datetime.datetime.now().strftime("%Y%m%d")
-            file_name = f"【{safe_name}_{file_time}】.csv"
-            
-            csv_data = df.to_csv(index=False).encode('utf-8-sig')
-            
-            st.download_button(
-                label=f"📥 下载 CSV 文件: {file_name}",
-                data=csv_data,
-                file_name=file_name,
-                mime="text/csv",
-                type="primary"
-            )
-            
-            st.caption("✅ 文件已包含 MACD, KDJ, RSI, BOLL 等全套技术指标，可直接投喂给 Gemini。")
-            
-            # 5. 数据预览 (表格模式)
-            st.markdown("### 📋 数据表内容")
-            st.dataframe(
-                df.sort_values('trade_date', ascending=False), 
-                use_container_width=True, 
-                height=600
-            )
-            
-            with st.expander("查看处理日志"):
-                st.write(logs)
+    if err:
+        st.error(err)
+        st.write(logs)
+    else:
+        # 成功
+        st.success(f"获取成功: {target_name} ({target_code})")
+        
+        # 补全
+        df['code'] = target_code
+        df['name'] = target_name
+        
+        # 展示
+        last = df.iloc[-1]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("股票", target_name)
+        c2.metric("收盘", f"{last['close']:.2f}")
+        c3.metric("涨跌", f"{last.get('pct_chg', 0):.2f}%")
+        c4.metric("换手", f"{last.get('turnover', 0):.2f}%")
+        
+        st.markdown("---")
+        
+        # 下载
+        safe_name = str(target_name).replace("*", "").replace(":", "")
+        file_time = datetime.datetime.now().strftime("%Y%m%d")
+        file_name = f"【{safe_name}_{file_time}】.csv"
+        csv_data = df.to_csv(index=False).encode('utf-8-sig')
+        
+        st.download_button(
+            label=f"📥 下载 CSV: {file_name}",
+            data=csv_data,
+            file_name=file_name,
+            mime="text/csv",
+            type="primary"
+        )
+        
+        st.caption("已包含 MACD, KDJ, MA 等指标，适合 Gemini 分析。")
+        
+        # 预览
+        st.markdown("### 📋 数据表")
+        st.dataframe(df.sort_values('trade_date', ascending=False), use_container_width=True, height=500)
